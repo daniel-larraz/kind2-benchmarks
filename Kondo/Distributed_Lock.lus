@@ -1,0 +1,178 @@
+datatype Option<T> = Some (value: T) | None;
+
+node imported nondet() returns (r: bool);
+
+type HostId;
+-- type HostId = enum {H1, H2, H3};
+
+-- The host that starts out holding the lock
+const H0: HostId;
+
+-- Ring successor. The concrete model orders the hosts in a ring and grants
+-- the lock to the next host in that ring, but the safety argument never
+-- appeals to the shape of the ring: a grant is accepted purely on the basis
+-- of its epoch. Leaving Successor uninterpreted therefore covers every
+-- possible hand-off topology, the ring included.
+function imported Successor(id: HostId) returns (r: HostId);
+
+type Message = struct { src: HostId; dst: HostId; epoch: int; };
+
+type MsgSet = set<Message>;
+
+-- Initial per-host state: host H0 holds the lock with epoch 1,
+-- every other host is at epoch 0 without the lock.
+-- Both maps are total, and map updates preserve totality, so reads are
+-- well-defined everywhere along any execution.
+const InitEpochs : subtype { m : map<HostId,int> |
+  (forall (h: HostId) h in m) and (m[H0] = 1) and
+  (forall (h: HostId) (h = H0) or (m[h] = 0)) };
+
+const InitLocks : subtype { m : map<HostId,bool> |
+  (forall (h: HostId) h in m) and m[H0] and
+  (forall (h: HostId) (h = H0) or (not m[h])) };
+
+-- A grant is in flight when its addressee would still accept it
+transparent function MsgInFlight(epochs: map<HostId,int>; m: Message) returns (r: bool);
+let
+  r = epochs[m.dst] < m.epoch;
+tel
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  frame (sentMsgs)
+    sentMsgs = {}@<Message>;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs + {send.value};
+    end
+  tel
+  recv = any { m: Option<Message> | Some?(m) ==> m.value in prevSentMsgs };
+tel
+
+node Host(id: HostId; nw_recv: Option<Message>;
+          last_epoch: int; last_lock: bool)
+  returns (nw_send: Option<Message>;
+           epoch: int; lock: bool);
+var recv_grant, send_grant: bool;
+let
+  recv_grant = Some?(nw_recv) and then (nw_recv.value.dst = id)
+               and then (last_epoch < nw_recv.value.epoch);
+
+  send_grant = None?(nw_recv) and last_lock and nondet();
+
+  nw_send = if send_grant
+            then Some(Message { src = id; dst = Successor(id);
+                                epoch = last_epoch + 1 })
+            else None@<Message>;
+
+  epoch = when recv_grant then nw_recv.value.epoch
+          else last_epoch;
+
+  lock = if recv_grant then true
+         else if send_grant then false
+         else last_lock;
+tel
+
+node Hosts(id: HostId; nw_recv: Option<Message>;
+          last_epochs: map<HostId,int>; last_locks: map<HostId,bool>)
+  returns (nw_send: Option<Message>;
+           epochs: map<HostId,int>; locks: map<HostId,bool>);
+var epoch: int; lock: bool;
+let
+  nw_send, epoch, lock = Host(id, nw_recv, last_epochs[id], last_locks[id]);
+  epochs = (last_epochs)[id := epoch];
+  locks = (last_locks)[id := lock];
+tel
+
+node DistributedSystem() returns (
+  epochs: map<HostId,int>;
+  locks: map<HostId,bool>;
+  sentMsgs: MsgSet
+);
+var tk_holder: Option<HostId>;
+var host_send: Option<Message>;
+var network_send, network_recv: Option<Message>;
+let
+  tk_holder = any { tk : Option<HostId> | None?(tk) -> Some?(tk) };
+
+  frame (host_send, epochs, locks)
+    host_send = None@<Message>;
+    epochs = InitEpochs;
+    locks = InitLocks;
+  let
+    when (Some?(tk_holder)) then
+      host_send, epochs, locks =
+        Hosts(tk_holder.value, network_recv, last epochs, last locks);
+    end
+  tel
+
+  if Some?(tk_holder) then
+    network_send = host_send;
+  else -- no one's turn
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  epochs: map<HostId,int>;
+  locks: map<HostId,bool>;
+  sentMsgs: MsgSet
+);
+(*@contract
+  guarantee "Safety"
+    forall (i: HostId) forall (j: HostId)
+      (locks[i] and locks[j]) => i = j;
+*)
+let
+  epochs, locks, sentMsgs = DistributedSystem();
+
+  check "At Most One Grant In Flight"
+    forall (m1: Message) forall (m2: Message)
+      ((m1 in sentMsgs) and (m2 in sentMsgs) and
+       MsgInFlight(epochs, m1) and MsgInFlight(epochs, m2))
+      => m1 = m2;
+
+  check "Lock Holder Implies No Grant In Flight"
+    forall (i: HostId) locks[i] =>
+      (forall (m: Message) (m in sentMsgs) =>
+        not MsgInFlight(epochs, m));
+
+  --%MAIN;
+tel
+
+node Reachability_Properties() returns (
+  epochs: map<HostId,int>;
+  locks: map<HostId,bool>;
+  sentMsgs: MsgSet
+);
+let
+  epochs, locks, sentMsgs = DistributedSystem();
+
+  check reachable "A grant msg is sent"
+    exists (m: Message) m in sentMsgs;
+
+  check reachable "A grant is in flight"
+    exists (m: Message) (m in sentMsgs) and MsgInFlight(epochs, m);
+
+  check reachable "The lock is in transit, so no host holds it"
+    forall (i: HostId) not locks[i];
+
+  check reachable "A host other than the initial one acquires the lock"
+    exists (h: HostId) (h <> H0) and locks[h];
+
+  check reachable "A grant goes stale"
+    exists (m: Message) (m in sentMsgs) and (not MsgInFlight(epochs, m));
+
+  check reachable "Two different grants are sent"
+    exists (m1: Message) exists (m2: Message)
+      (m1 in sentMsgs) and (m2 in sentMsgs) and (m1 <> m2);
+
+  check reachable "The initial holder reacquires the lock after another host held it"
+    locks[H0] and (epochs[H0] > 1) and
+    (exists (h: HostId) (h <> H0) and (epochs[h] > 0));
+tel
