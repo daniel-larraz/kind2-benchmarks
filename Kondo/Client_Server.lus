@@ -103,11 +103,6 @@ node DistributedSystem() returns (
   currentRequest: Option<Request>;
   responses: Responses
 );
-(*@contract
-  guarantee "Safety: every response collected by a client is for a request that client actually made"
-    forall (r: Request) r in responses[r.clientId] =>
-      r.reqId in Requests[r.clientId];
-*)
 var tk_holder: Token_Holder;
 var server_send, client_send: Option<Message>;
 var network_send, network_recv: Option<Message>;
@@ -143,15 +138,20 @@ let
   fi
 
   network_recv, sentMsgs = Network(network_send);
+tel
 
-  check "Clients Only Send Request Msgs"
-    Some?(client_send) ==> RequestMsg?(client_send.value);
-
-  check "Server Only Sends Response Msgs"
-    Some?(server_send) ==> ResponseMsg?(server_send.value);
-
-  check "Received Msgs Were Sent"
-    Some?(network_recv) ==> network_recv.value in sentMsgs;
+node Invariant_Properties() returns (
+  sentMsgs: MsgSet;
+  currentRequest: Option<Request>;
+  responses: Responses
+);
+(*@contract
+  guarantee "Safety: every response collected by a client is for a request that client actually made"
+    forall (r: Request) r in responses[r.clientId] =>
+      r.reqId in Requests[r.clientId];
+*)
+let
+  sentMsgs, currentRequest, responses = DistributedSystem();
 
   check "Request Msgs Agree With Client Requests"
     forall (msg: Message) (msg in sentMsgs and RequestMsg?(msg)) ==>
@@ -168,4 +168,41 @@ let
   check "Response Msgs Correspond To Request Msg"
     forall (msg: Message) (msg in sentMsgs and ResponseMsg?(msg)) ==>
       RequestMsg(msg.resp) in sentMsgs;
+
+  --%MAIN;
+tel
+
+node Reachability_Properties() returns (
+  sentMsgs: MsgSet;
+  currentRequest: Option<Request>;
+  responses: Responses
+);
+let
+  sentMsgs, currentRequest, responses = DistributedSystem();
+
+  check reachable "A request msg is sent"
+    exists (m: Message) (m in sentMsgs) and RequestMsg?(m);
+
+  check reachable "The server buffers a request"
+    Some?(currentRequest);
+
+  check reachable "A response msg is sent"
+    exists (m: Message) (m in sentMsgs) and ResponseMsg?(m);
+
+  check reachable "A client collects a response"
+    exists (r: Request) r in responses[r.clientId];
+
+  check reachable "The server starts a second request cycle"
+    Some?(currentRequest) and
+    (exists (m: Message) (m in sentMsgs) and ResponseMsg?(m));
+
+  check reachable "A client collects two different responses"
+    exists (r1: Request) exists (r2: Request)
+      (r1.clientId = r2.clientId) and (r1.reqId <> r2.reqId) and
+      (r1 in responses[r1.clientId]) and (r2 in responses[r2.clientId]);
+
+  check reachable "Two different clients collect responses"
+    exists (r1: Request) exists (r2: Request)
+      (r1.clientId <> r2.clientId) and
+      (r1 in responses[r1.clientId]) and (r2 in responses[r2.clientId]);
 tel
