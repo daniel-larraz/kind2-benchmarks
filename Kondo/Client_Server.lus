@@ -23,7 +23,7 @@ datatype Message =
 
 type MsgSet = set<Message>;
 
-type ReqSet = set<Request>;
+type ReqSet = set<RequestId>;
 
 type Responses = map<ClientId,ReqSet>;
 
@@ -85,7 +85,7 @@ let
 
   responses =
     when recv_response then
-      last_responses + {Request {clientId=id; reqId=nw_recv.value.resp.reqId}}
+      last_responses + {nw_recv.value.resp.reqId}
     else
       last_responses;
 tel
@@ -121,7 +121,7 @@ let
   frame (client_send, responses)
     client_send = None@<Message>;
     responses = any { m : Responses | 
-      forall (c: ClientId) c in m and m[c] = {}@<Request> };
+      forall (c: ClientId) c in m and m[c] = {}@<RequestId> };
   let
     when (ClientHost?(tk_holder)) then
       client_send, responses =
@@ -147,8 +147,8 @@ node Invariant_Properties() returns (
 );
 (*@contract
   guarantee "Safety: every response collected by a client is for a request that client actually made"
-    forall (r: Request) r in responses[r.clientId] =>
-      r.reqId in Requests[r.clientId];
+    forall (c: ClientId) forall (r: RequestId) r in responses[c] =>
+      r in Requests[c];
 *)
 let
   sentMsgs, currentRequest, responses = DistributedSystem();
@@ -162,8 +162,8 @@ let
       RequestMsg(currentRequest.value) in sentMsgs;
 
   check "Client Responses Supported By Response Msg"
-    forall (r: Request) r in responses[r.clientId] ==>
-      ResponseMsg(r) in sentMsgs;
+    forall (c: ClientId) forall (r: RequestId) r in responses[c] ==>
+      ResponseMsg(Request {clientId=c; reqId=r}) in sentMsgs;
 
   check "Response Msgs Correspond To Request Msg"
     forall (msg: Message) (msg in sentMsgs and ResponseMsg?(msg)) ==>
@@ -190,19 +190,18 @@ let
     exists (m: Message) (m in sentMsgs) and ResponseMsg?(m);
 
   check reachable "A client collects a response"
-    exists (r: Request) r in responses[r.clientId];
+    exists (c: ClientId) exists (r: RequestId) r in responses[c];
 
   check reachable "The server starts a second request cycle"
     Some?(currentRequest) and
     (exists (m: Message) (m in sentMsgs) and ResponseMsg?(m));
 
   check reachable "A client collects two different responses"
-    exists (r1: Request) exists (r2: Request)
-      (r1.clientId = r2.clientId) and (r1.reqId <> r2.reqId) and
-      (r1 in responses[r1.clientId]) and (r2 in responses[r2.clientId]);
+    exists (c: ClientId) exists (r1: RequestId) exists (r2: RequestId)
+      (r1 <> r2) and (r1 in responses[c]) and (r2 in responses[c]);
 
   check reachable "Two different clients collect responses"
-    exists (r1: Request) exists (r2: Request)
-      (r1.clientId <> r2.clientId) and
-      (r1 in responses[r1.clientId]) and (r2 in responses[r2.clientId]);
+    exists (c1: ClientId) exists (c2: ClientId)
+      exists (r1: RequestId) exists (r2: RequestId)
+      (c1 <> c2) and (r1 in responses[c1]) and (r2 in responses[c2]);
 tel
