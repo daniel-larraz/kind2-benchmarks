@@ -1,0 +1,171 @@
+datatype Option<T> = Some (value: T) | None;
+
+node imported nondet() returns (r: bool);
+
+type ClientId;
+
+type RequestId = int;
+
+datatype Token_Holder =  ServerHost | ClientHost (id: ClientId) | NoHost;
+
+type Request = struct {
+  clientId: ClientId;
+  reqId: RequestId;
+};
+
+-- Each client has a non-empty set of requests it may issue
+const Requests : subtype { m : map<ClientId,set<RequestId>> |
+  (forall (c: ClientId) (c in m and (exists (r: RequestId) r in m[c]))) };
+
+datatype Message =
+  | RequestMsg (req: Request)
+  | ResponseMsg (resp: Request);
+
+type MsgSet = set<Message>;
+
+type ReqSet = set<Request>;
+
+type Responses = map<ClientId,ReqSet>;
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  frame (sentMsgs)
+    sentMsgs = {}@<Message>;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs + {send.value};
+    end
+  tel
+  recv = any { m: Option<Message> | Some?(m) ==> m.value in prevSentMsgs };
+tel
+
+node Server(nw_recv: Option<Message>)
+  returns (nw_send: Option<Message>; currentRequest: Option<Request>);
+let
+  frame (nw_send, currentRequest)
+    nw_send = None@<Message>;
+    currentRequest = None@<Request>;
+  let
+    when Some?(nw_recv) then
+      -- receive step: buffer the request, send nothing
+      when (RequestMsg?(nw_recv.value) and None?(last currentRequest)) then
+        currentRequest = Some(nw_recv.value.req);
+      end
+      nw_send = None@<Message>;
+    else
+      when (nondet() and Some?(last currentRequest)) then
+        -- process step: respond to the buffered request, receive nothing
+        nw_send = Some(ResponseMsg((last currentRequest).value));
+        currentRequest = None@<Request>;
+      else
+        -- stutter step
+        nw_send = None@<Message>;
+      end
+    end
+  tel
+tel
+
+node Client(id: ClientId; nw_recv: Option<Message>; last_responses: ReqSet)
+  returns (nw_send: Option<Message>; responses: ReqSet);
+var recv_response: bool;
+var req_choice: Option<RequestId>;
+let
+  recv_response = 
+    Some?(nw_recv) and then ResponseMsg?(nw_recv.value)
+    and then nw_recv.value.resp.clientId = id;
+
+  req_choice = any { r: Option<RequestId> | Some?(r) ==> (r.value in Requests[id]) };
+
+  nw_send = when None?(nw_recv) and Some?(req_choice)
+            then Some(RequestMsg(Request {clientId=id; reqId=req_choice.value}))
+            else None@<Message>;
+
+  responses =
+    when recv_response then
+      last_responses + {Request {clientId=id; reqId=nw_recv.value.resp.reqId}}
+    else
+      last_responses;
+tel
+
+node Clients(id: ClientId; nw_recv: Option<Message>; last_responses: Responses)
+  returns (nw_send: Option<Message>; responses: Responses);
+var client_responses: ReqSet;
+let
+  nw_send, client_responses = Client(id, nw_recv, last_responses[id]);
+  responses = (last_responses)[id := client_responses];
+tel
+
+node DistributedSystem() returns (
+  sentMsgs: MsgSet;
+  currentRequest: Option<Request>;
+  responses: Responses
+);
+(*@contract
+  guarantee "Safety: every response collected by a client is for a request that client actually made"
+    forall (r: Request) r in responses[r.clientId] =>
+      r.reqId in Requests[r.clientId];
+*)
+var tk_holder: Token_Holder;
+var server_send, client_send: Option<Message>;
+var network_send, network_recv: Option<Message>;
+let
+  tk_holder = any { tk : Token_Holder | tk = NoHost -> tk <> NoHost };
+
+  frame (server_send, currentRequest)
+    server_send = None@<Message>;
+    currentRequest = None@<Request>;
+  let
+    when (ServerHost?(tk_holder)) then
+      server_send, currentRequest = Server(network_recv);
+    end
+  tel
+
+  frame (client_send, responses)
+    client_send = None@<Message>;
+    responses = any { m : Responses | 
+      forall (c: ClientId) c in m and m[c] = {}@<Request> };
+  let
+    when (ClientHost?(tk_holder)) then
+      client_send, responses =
+        Clients(tk_holder.id, network_recv, last responses);
+    end
+  tel
+
+  if ServerHost?(tk_holder) then
+    network_send = server_send;
+  elsif ClientHost?(tk_holder) then
+    network_send = client_send;
+  else -- tk_holder = NoHost
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs = Network(network_send);
+
+  check "Clients Only Send Request Msgs"
+    Some?(client_send) ==> RequestMsg?(client_send.value);
+
+  check "Server Only Sends Response Msgs"
+    Some?(server_send) ==> ResponseMsg?(server_send.value);
+
+  check "Received Msgs Were Sent"
+    Some?(network_recv) ==> network_recv.value in sentMsgs;
+
+  check "Request Msgs Agree With Client Requests"
+    forall (msg: Message) (msg in sentMsgs and RequestMsg?(msg)) ==>
+      msg.req.reqId in Requests[msg.req.clientId];
+
+  check "Server Current Request Supported By Request Msg"
+    Some?(currentRequest) ==>
+      RequestMsg(currentRequest.value) in sentMsgs;
+
+  check "Client Responses Supported By Response Msg"
+    forall (r: Request) r in responses[r.clientId] ==>
+      ResponseMsg(r) in sentMsgs;
+
+  check "Response Msgs Correspond To Request Msg"
+    forall (msg: Message) (msg in sentMsgs and ResponseMsg?(msg)) ==>
+      RequestMsg(msg.resp) in sentMsgs;
+tel
