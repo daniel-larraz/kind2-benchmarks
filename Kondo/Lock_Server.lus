@@ -1,0 +1,239 @@
+datatype Option<T> = Some (value: T) | None;
+
+node imported nondet() returns (r: bool);
+
+type ClientId;
+
+datatype Token_Holder =  ServerHost | ClientHost (id: ClientId) | NoHost;
+
+datatype Message =
+  | Grant (gdst: ClientId, gepoch: int)
+  | Release (rsrc: ClientId, repoch: int);
+
+type MsgSet = set<Message>;
+
+const InitClientLocks : subtype { m : map<ClientId,bool> |
+  (forall (c: ClientId) c in m and not m[c]) };
+
+const InitClientEpochs : subtype { m : map<ClientId,int> |
+  (forall (c: ClientId) c in m and m[c] >= 0) };
+
+const InitServerEpoch : subtype { e : int | e >= 0 };
+
+transparent function LockInFlight(
+  epochs: map<ClientId,int>; srv_epoch: int; m: Message
+) returns (r: bool);
+let
+  r = when Grant?(m) then epochs[m.gdst] < m.gepoch
+      else srv_epoch < m.repoch;
+tel
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  frame (sentMsgs)
+    sentMsgs = {}@<Message>;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs + {send.value};
+    end
+  tel
+  recv = any { m: Option<Message> | Some?(m) ==> m.value in prevSentMsgs };
+tel
+
+node Server(nw_recv: Option<Message>)
+  returns (nw_send: Option<Message>; hasLock: bool; epoch: int);
+var grantee: ClientId;
+let
+  grantee = any@<ClientId>;
+  frame (nw_send, hasLock, epoch)
+    nw_send = None@<Message>;
+    hasLock = true;
+    epoch = InitServerEpoch;
+  let
+    when Some?(nw_recv) then
+      -- receive step: regain the lock, send nothing
+      when (Release?(nw_recv.value) and then ((last epoch) < nw_recv.value.repoch)) then
+        epoch = nw_recv.value.repoch;
+        hasLock = true;
+      end
+      nw_send = None@<Message>;
+    else
+      when (nondet() and (last hasLock)) then
+        -- grant step: give the lock to an arbitrary client, receive nothing
+        nw_send = Some(Grant(grantee, (last epoch) + 1));
+        hasLock = false;
+      else
+        -- stutter step
+        nw_send = None@<Message>;
+      end
+    end
+  tel
+tel
+
+node Client(id: ClientId; nw_recv: Option<Message>;
+            last_lock: bool; last_epoch: int)
+  returns (nw_send: Option<Message>; lock: bool; epoch: int);
+var recv_grant, send_release: bool;
+let
+  recv_grant = Some?(nw_recv) and then Grant?(nw_recv.value)
+               and then (nw_recv.value.gdst = id)
+               and then (last_epoch < nw_recv.value.gepoch);
+
+  send_release = None?(nw_recv) and last_lock and nondet();
+
+  nw_send = if send_release then Some(Release(id, last_epoch + 1))
+            else None@<Message>;
+
+  lock = if recv_grant then true
+         else if send_release then false
+         else last_lock;
+
+  epoch = when recv_grant then nw_recv.value.gepoch
+          else last_epoch;
+tel
+
+node Clients(id: ClientId; nw_recv: Option<Message>;
+            last_locks: map<ClientId,bool>; last_epochs: map<ClientId,int>)
+  returns (nw_send: Option<Message>;
+           locks: map<ClientId,bool>;
+           epochs: map<ClientId,int>);
+var epoch: int; lock: bool;
+let
+  nw_send, lock, epoch = Client(id, nw_recv, last_locks[id], last_epochs[id]);
+  epochs = (last_epochs)[id := epoch];
+  locks = (last_locks)[id := lock];
+tel
+
+node DistributedSystem() returns (
+  clientHasLock: map<ClientId,bool>;
+  clientEpochs: map<ClientId,int>;
+  serverHasLock: bool;
+  serverEpoch: int;
+  sentMsgs: MsgSet
+);
+var tk_holder: Token_Holder;
+var server_send, client_send: Option<Message>;
+var network_send, network_recv: Option<Message>;
+
+let
+  tk_holder = any { tk : Token_Holder | tk = NoHost -> tk <> NoHost };
+
+  frame (server_send, serverHasLock, serverEpoch)
+    server_send = None@<Message>;
+    serverHasLock = true;
+    serverEpoch = InitServerEpoch;
+  let
+    when (ServerHost?(tk_holder)) then
+      server_send, serverHasLock, serverEpoch = Server(network_recv);
+    end
+  tel
+
+  frame (client_send, clientHasLock, clientEpochs)
+    client_send = None@<Message>;
+    clientHasLock = InitClientLocks;
+    clientEpochs = InitClientEpochs;
+  let
+    when (ClientHost?(tk_holder)) then
+      client_send, clientHasLock, clientEpochs =
+        Clients(tk_holder.id, network_recv,
+                last clientHasLock, last clientEpochs);
+    end
+  tel
+
+  if ServerHost?(tk_holder) then
+    network_send = server_send;
+  elsif ClientHost?(tk_holder) then
+    network_send = client_send;
+  else -- NoHost? (tk_holder)
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  clientHasLock: map<ClientId,bool>;
+  clientEpochs: map<ClientId,int>;
+  serverHasLock: bool;
+  serverEpoch: int;
+  sentMsgs: MsgSet
+);
+(*@contract
+  guarantee "Safety: at most one client holds the lock"
+    forall (c1: ClientId) forall (c2: ClientId)
+      (clientHasLock[c1] and clientHasLock[c2]) => c1 = c2;
+*)
+let
+  clientHasLock, clientEpochs, serverHasLock, serverEpoch, sentMsgs =
+    DistributedSystem();
+
+  check "At Most One Lock In Flight"
+    forall (m1: Message) forall (m2: Message)
+      ((m1 in sentMsgs) and (m2 in sentMsgs) and
+       LockInFlight(clientEpochs, serverEpoch, m1) and
+       LockInFlight(clientEpochs, serverEpoch, m2))
+      => m1 = m2;
+
+  check "Lock Holder Implies Lock Not In Flight"
+    (serverHasLock or (exists (c: ClientId) clientHasLock[c])) =>
+      (forall (m: Message) (m in sentMsgs) =>
+        not LockInFlight(clientEpochs, serverEpoch, m));
+
+  check "Server Holds Lock Implies No Client Holds Lock"
+    serverHasLock => (forall (c: ClientId) not clientHasLock[c]);
+
+  --%MAIN;
+tel
+
+node Reachability_Properties() returns (
+  clientHasLock: map<ClientId,bool>;
+  clientEpochs: map<ClientId,int>;
+  serverHasLock: bool;
+  serverEpoch: int;
+  sentMsgs: MsgSet
+);
+let
+  clientHasLock, clientEpochs, serverHasLock, serverEpoch, sentMsgs =
+    DistributedSystem();
+
+  check reachable "A grant msg is sent"
+    exists (m: Message) (m in sentMsgs) and Grant?(m);
+
+  check reachable "A grant is in flight"
+    exists (m: Message) (m in sentMsgs) and Grant?(m) and
+      LockInFlight(clientEpochs, serverEpoch, m);
+
+  check reachable "The lock is in transit, so no host holds it"
+    (not serverHasLock) and (forall (c: ClientId) not clientHasLock[c]);
+
+  check reachable "A client acquires the lock"
+    exists (c: ClientId) clientHasLock[c];
+
+  check reachable "A release msg is sent"
+    exists (m: Message) (m in sentMsgs) and Release?(m);
+
+  check reachable "A release is in flight"
+    exists (m: Message) (m in sentMsgs) and Release?(m) and
+      LockInFlight(clientEpochs, serverEpoch, m);
+
+  check reachable "The server reacquires the lock after a client held it"
+    serverHasLock and (serverEpoch > InitServerEpoch);
+
+  check reachable "A grant goes stale"
+    exists (m: Message) (m in sentMsgs) and Grant?(m) and
+      (not LockInFlight(clientEpochs, serverEpoch, m));
+
+  check reachable "Two different grants are sent"
+    exists (m1: Message) exists (m2: Message)
+      (m1 in sentMsgs) and (m2 in sentMsgs) and
+      Grant?(m1) and Grant?(m2) and (m1 <> m2);
+
+  check reachable "Two different clients acquire the lock"
+    exists (c1: ClientId) exists (c2: ClientId)
+      (c1 <> c2) and
+      (clientEpochs[c1] > InitClientEpochs[c1]) and
+      (clientEpochs[c2] > InitClientEpochs[c2]);
+tel
