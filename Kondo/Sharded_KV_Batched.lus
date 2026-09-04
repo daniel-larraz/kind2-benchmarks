@@ -1,0 +1,317 @@
+type VersionId = int;
+
+datatype Option<T> = Some (value: T) | None;
+
+type HostId;
+-- type HostId = enum {H1, H2};
+
+type Key = int;
+-- type Key = enum {K1, K2, K3, K4};
+
+datatype Entry = Entry (live: bool, version: VersionId);
+
+-- A batch of keys with their new versions. The map is partial: its domain
+-- is the set of keys carried by the message.
+type VersionedKeys = map<Key, VersionId>;
+
+type KeySet = set<Key>;
+
+datatype Message = Reconf (src: HostId, dst: HostId, vks: VersionedKeys);
+
+-- Kind 2 does not accept a datatype that contains a map as a set element,
+-- so the network's set of sent messages is represented as an append-only
+-- log indexed by 0 .. numSent-1. Membership in the Dafny set becomes
+-- existence of an index in the log.
+type MsgLog = map<int, Message>;
+
+const InitKeys : subtype { m : map<HostId, map<Key, Entry>> |
+  (forall (h: HostId) h in m)
+  and
+  (forall (h: HostId) forall (k: Key) k in m[h])
+  and
+  (forall (h: HostId) forall (k: Key) (m[h][k]).version = 0)
+  and
+  (forall (k: Key) forall (i: HostId) forall (j: HostId)
+    ((m[i][k]).live and (m[j][k]).live) => i = j) };
+
+-- Each host's initial nextKeysToSend is a non-empty set of its live keys
+const InitNextKeys : subtype { nk : map<HostId, KeySet> |
+  (forall (h: HostId) h in nk)
+  and
+  (forall (h: HostId) exists (k: Key) k in nk[h])
+  and
+  (forall (h: HostId) forall (k: Key) (k in nk[h]) => (InitKeys[h][k]).live) };
+
+-- Any host is a valid initial destination
+const InitNextDst : map<HostId, HostId>;
+
+-- Key k of message m is in flight when its addressee would still accept it
+transparent function KeyInFlight(
+  keys: map<HostId, map<Key, Entry>>; m: Message; k: Key
+) returns (r: bool);
+let
+  r = (k in m.vks) and then ((keys[m.dst][k]).version < m.vks[k]);
+tel
+
+-- Dafny's HasLiveKeySet: a non-empty set of keys that are all live
+function imported HasLiveKeySet(keys: map<Key, Entry>; ks: KeySet)
+  returns (r: bool);
+(*@contract
+  guarantee r = ((exists (k: Key) k in ks) and
+                 (forall (k: Key) (k in ks) => (keys[k]).live));
+*)
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgLog; numSent: int);
+var prevSentMsgs: MsgLog;
+var prevNumSent: int;
+var recv_idx: Option<int>;
+let
+  prevSentMsgs = map[]@<int, Message> -> pre sentMsgs;
+  prevNumSent = 0 -> pre numSent;
+  frame (sentMsgs, numSent)
+    sentMsgs = map[]@<int, Message>;
+    numSent = 0;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs[prevNumSent := send.value];
+      numSent = prevNumSent + 1;
+    end
+  tel
+  -- Deliver any message sent so far, or nothing
+  recv_idx = any { i: Option<int> | Some?(i) ==>
+                   ((0 <= i.value) and (i.value < prevNumSent)) };
+  recv = when Some?(recv_idx) then Some(prevSentMsgs[recv_idx.value])
+         else None@<Message>;
+tel
+
+node Host(id: HostId; nw_recv: Option<Message>;
+          last_keys: map<Key, Entry>;
+          last_nextKeys: KeySet;
+          last_nextDst: HostId)
+  returns (nw_send: Option<Message>;
+           keys: map<Key, Entry>;
+           nextKeys: KeySet;
+           nextDst: HostId);
+var recv_reconf, send_reconf: bool;
+var recv_msg: Message;
+var recv_keys, send_keys: map<Key, Entry>;
+var batch: VersionedKeys;
+var next_keys_choice: Option<KeySet>;
+var next_dst_choice: HostId;
+let
+  -- Receive step (NextReceiveStep). Every delivered message is processed:
+  -- its only enabling condition is that the host knows the message's keys,
+  -- which always holds since key maps are total.
+  recv_reconf = Some?(nw_recv);
+
+  recv_msg = when Some?(nw_recv) then nw_recv.value
+             else Reconf(id, id, map[]@<Key, VersionId>);
+
+  -- Post-state of a receive. A key becomes live with the version carried by
+  -- the message when it is in flight for this host. Every other key is
+  -- marked NOT live and keeps its version, exactly as in hosts.dfy.
+  -- (The Dafny model most likely meant to leave the other keys unchanged.
+  -- For that reading replace `not (m[k]).live` in the else branch by
+  -- `(m[k]).live = (last_keys[k]).live`.)
+  recv_keys = any { m: map<Key, Entry> |
+    forall (k: Key) (k in m) and
+      (if (((recv_msg.dst = id) and (k in recv_msg.vks)) and then
+           ((last_keys[k]).version < recv_msg.vks[k]))
+       then ((m[k]).live and ((m[k]).version = recv_msg.vks[k]))
+       else ((not (m[k]).live) and
+             ((m[k]).version = (last_keys[k]).version))) };
+
+  -- Send step (SendReconf). The batch maps every key in nextKeysToSend to
+  -- its incremented version.
+  batch = any { m: VersionedKeys |
+    forall (k: Key) ((k in m) = (k in last_nextKeys)) and
+      ((k in last_nextKeys) => (m[k] = (last_keys[k]).version + 1)) };
+
+  -- Post-state of a send: the keys of the batch are marked not live
+  send_keys = any { m: map<Key, Entry> |
+    forall (k: Key) (k in m) and
+      ((m[k]).live = ((last_keys[k]).live and (not (k in last_nextKeys)))) and
+      ((m[k]).version = (last_keys[k]).version) };
+
+  -- Choice of nextKeysToSend for the post-state of a send: a non-empty set
+  -- of keys that are still live once the batch has been marked not live
+  next_keys_choice = any { ko: Option<KeySet> | Some?(ko) ==>
+    ((exists (k: Key) k in ko.value) and
+     (forall (k: Key) (k in ko.value) =>
+        ((last_keys[k]).live and (not (k in last_nextKeys))))) };
+
+  next_dst_choice = any@<HostId>;
+
+  send_reconf =
+    None?(nw_recv) and HasLiveKeySet(last_keys, last_nextKeys)
+    and Some?(next_keys_choice);
+
+  nw_send =
+    when send_reconf then Some(Reconf(id, last_nextDst, batch))
+    else None@<Message>;
+
+  keys =
+    when recv_reconf then recv_keys
+    else when send_reconf then send_keys
+    else last_keys;
+
+  nextKeys =
+    when send_reconf then next_keys_choice.value else last_nextKeys;
+
+  nextDst =
+    when send_reconf then next_dst_choice else last_nextDst;
+tel
+
+node Hosts(id: HostId; nw_recv: Option<Message>;
+           last_keys: map<HostId, map<Key, Entry>>;
+           last_nextKeys: map<HostId, KeySet>;
+           last_nextDst: map<HostId, HostId>)
+  returns (nw_send: Option<Message>;
+           keys: map<HostId, map<Key, Entry>>;
+           nextKeys: map<HostId, KeySet>;
+           nextDst: map<HostId, HostId>);
+var host_keys: map<Key, Entry>;
+var host_nextKeys: KeySet;
+var host_nextDst: HostId;
+let
+  nw_send, host_keys, host_nextKeys, host_nextDst =
+    Host(id, nw_recv, last_keys[id], last_nextKeys[id], last_nextDst[id]);
+  keys = last_keys[id := host_keys];
+  nextKeys = last_nextKeys[id := host_nextKeys];
+  nextDst = last_nextDst[id := host_nextDst];
+tel
+
+node DistributedSystem() returns (
+  myKeys: map<HostId, map<Key, Entry>>;
+  nextKeysToSend: map<HostId, KeySet>;
+  nextDst: map<HostId, HostId>;
+  sentMsgs: MsgLog;
+  numSent: int
+);
+var tk_holder: Option<HostId>;
+var host_send: Option<Message>;
+var network_send, network_recv: Option<Message>;
+
+let
+  tk_holder = any { tk : Option<HostId> | None?(tk) -> Some?(tk) };
+
+  frame (host_send, myKeys, nextKeysToSend, nextDst)
+    host_send = None@<Message>;
+    myKeys = InitKeys;
+    nextKeysToSend = InitNextKeys;
+    nextDst = InitNextDst;
+  let
+    when (Some?(tk_holder)) then
+      host_send, myKeys, nextKeysToSend, nextDst =
+        Hosts(tk_holder.value, network_recv,
+              last myKeys, last nextKeysToSend, last nextDst);
+    end
+  tel
+
+  if Some?(tk_holder) then
+    network_send = host_send;
+  else -- no one's turn
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs, numSent = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  myKeys: map<HostId, map<Key, Entry>>;
+  nextKeysToSend: map<HostId, KeySet>;
+  nextDst: map<HostId, HostId>;
+  sentMsgs: MsgLog;
+  numSent: int
+);
+(*@contract
+  guarantee "Safety: each key is live at no more than one host"
+    forall (i: HostId) forall (j: HostId) forall (k: Key)
+      ((myKeys[i][k]).live and (myKeys[j][k]).live) => i = j;
+*)
+let
+  myKeys, nextKeysToSend, nextDst, sentMsgs, numSent = DistributedSystem();
+
+  check "Sent Msgs Log Is Well Formed"
+    (numSent >= 0) and
+    (forall (i: int) ((0 <= i) and (i < numSent)) => i in sentMsgs);
+
+  check "At Most One Reconf In Flight Per Key"
+    forall (i: int) forall (j: int) forall (k: Key)
+      ((0 <= i) and (i < numSent) and (0 <= j) and (j < numSent) and
+       KeyInFlight(myKeys, sentMsgs[i], k) and
+       KeyInFlight(myKeys, sentMsgs[j], k))
+      => sentMsgs[i] = sentMsgs[j];
+
+  check "Live Key Implies No Reconf In Flight"
+    forall (h: HostId) forall (i: int) forall (k: Key)
+      ((myKeys[h][k]).live and (0 <= i) and (i < numSent)) =>
+        not KeyInFlight(myKeys, sentMsgs[i], k);
+
+  --%MAIN;
+tel
+
+-- Witnesses for these properties are only found when HostId and Key are
+-- instantiated with finite enumerations: uncomment the alternative
+-- declarations of those two types near the top of the file. Two hosts and
+-- four keys suffice for every property below. See Sharded_KV.lus for why
+-- the abstract types defeat bounded model checking here.
+--
+-- Two properties of Sharded_KV.lus have no counterpart here because they
+-- are unreachable in this model: a key is never transferred a second time,
+-- and a key never returns to its initial owner. Receiving a message marks
+-- every key that is not in flight as not live, so after its first receive
+-- a host's nextKeysToSend are dead and it can never send again.
+node Reachability_Properties() returns (
+  myKeys: map<HostId, map<Key, Entry>>;
+  nextKeysToSend: map<HostId, KeySet>;
+  nextDst: map<HostId, HostId>;
+  sentMsgs: MsgLog;
+  numSent: int
+);
+let
+  myKeys, nextKeysToSend, nextDst, sentMsgs, numSent = DistributedSystem();
+
+  check reachable "A reconf msg is sent"
+    numSent > 0;
+
+  check reachable "A key is in flight"
+    exists (i: int) exists (k: Key)
+      (0 <= i) and (i < numSent) and KeyInFlight(myKeys, sentMsgs[i], k);
+
+  check reachable "A key is in transit, so no host holds it live"
+    exists (i: int) exists (k: Key)
+      (0 <= i) and (i < numSent) and KeyInFlight(myKeys, sentMsgs[i], k) and
+      (forall (h: HostId) not (myKeys[h][k]).live);
+
+  check reachable "A host holds a key it did not start with"
+    exists (h: HostId) exists (k: Key)
+      (myKeys[h][k]).live and (not (InitKeys[h][k]).live);
+
+  check reachable "A host updates its next keys to send"
+    exists (h: HostId) nextKeysToSend[h] <> InitNextKeys[h];
+
+  check reachable "A whole batch goes stale"
+    exists (i: int) (0 <= i) and (i < numSent) and
+      (forall (k: Key) not KeyInFlight(myKeys, sentMsgs[i], k));
+
+  check reachable "A batch carries two different keys"
+    exists (i: int) exists (k1: Key) exists (k2: Key)
+      (0 <= i) and (i < numSent) and (k1 <> k2) and
+      (k1 in sentMsgs[i].vks) and (k2 in sentMsgs[i].vks);
+
+  check reachable "Two different reconf msgs are sent"
+    exists (i: int) exists (j: int)
+      (0 <= i) and (i < numSent) and (0 <= j) and (j < numSent) and
+      (sentMsgs[i] <> sentMsgs[j]);
+
+  check reachable "Two different hosts send a reconf"
+    exists (i: int) exists (j: int)
+      (0 <= i) and (i < numSent) and (0 <= j) and (j < numSent) and
+      (sentMsgs[i].src <> sentMsgs[j].src);
+
+  check reachable "A host sends a reconf to itself"
+    exists (i: int)
+      (0 <= i) and (i < numSent) and (sentMsgs[i].src = sentMsgs[i].dst);
+tel
