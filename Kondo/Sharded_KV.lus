@@ -1,0 +1,177 @@
+type VersionId = int;
+
+datatype Option<T> = Some (value: T) | None;
+
+type HostId;
+
+type Key = int;
+
+datatype Entry = Entry (live: bool, version: VersionId);
+
+datatype Message = Reconf (src: HostId, dst: HostId, key: Key, version: VersionId);
+
+type MsgSet = set<Message>;
+
+const InitKeys : subtype { m : map<HostId, map<Key, Entry>> |
+  (forall (h: HostId) h in m)
+  and
+  (forall (h: HostId) forall (k: Key) k in m[h])
+  and
+  (forall (h: HostId) forall (k: Key) (m[h][k]).version = 0)
+  and
+  (forall (k: Key) forall (i: HostId) forall (j: HostId)
+    ((m[i][k]).live and (m[j][k]).live) => i = j) };
+
+-- Each host's initial nextKeyToSend must be one of its live keys
+const InitNextKey : subtype { nk : map<HostId, Key> |
+  forall (h: HostId) (InitKeys[h][nk[h]]).live };
+
+-- Any host is a valid initial destination
+const InitNextDst : map<HostId, HostId>;
+
+transparent function KeyInFlight(
+  keys: map<HostId, map<Key, Entry>>; m: Message
+) returns (r: bool);
+let
+  r = (keys[m.dst][m.key]).version < m.version;
+tel
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  frame (sentMsgs)
+    sentMsgs = {}@<Message>;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs + {send.value};
+    end
+  tel
+  recv = any { m: Option<Message> | Some?(m) ==> m.value in prevSentMsgs };
+tel
+
+node Host(id: HostId; nw_recv: Option<Message>;
+          last_keys: map<Key, Entry>;
+          last_nextKey: Key;
+          last_nextDst: HostId)
+  returns (nw_send: Option<Message>;
+           keys: map<Key, Entry>;
+           nextKey: Key;
+           nextDst: HostId);
+var recv_reconf, send_reconf: bool;
+var next_key_choice: Option<Key>;
+var next_dst_choice: HostId;
+let
+  recv_reconf =
+    Some?(nw_recv) and then (nw_recv.value.dst = id)
+    and then ((last_keys[nw_recv.value.key]).version < nw_recv.value.version);
+
+  -- Choice of nextKeyToSend for the post-state of a send:
+  -- it must be live after last_nextKey is marked non-live
+  next_key_choice = any { ko: Option<Key> | Some?(ko) ==>
+                          (ko.value <> last_nextKey and
+                           (last_keys[ko.value]).live) };
+
+  next_dst_choice = any@<HostId>;
+
+  send_reconf =
+    None?(nw_recv) and (last_keys[last_nextKey]).live
+    and Some?(next_key_choice);
+
+  nw_send =
+    when send_reconf then
+      Some(Reconf(id, last_nextDst, last_nextKey,
+                  (last_keys[last_nextKey]).version + 1))
+    else
+      None@<Message>;
+
+  keys =
+    when recv_reconf then
+      last_keys[nw_recv.value.key := Entry(true, nw_recv.value.version)]
+    else
+      when send_reconf then
+        last_keys[last_nextKey :=
+          Entry(false, (last_keys[last_nextKey]).version)]
+      else
+        last_keys;
+
+  nextKey =
+    when send_reconf then next_key_choice.value else last_nextKey;
+
+  nextDst =
+    when send_reconf then next_dst_choice else last_nextDst;
+tel
+
+node Hosts(id: HostId; nw_recv: Option<Message>;
+           last_keys: map<HostId, map<Key, Entry>>;
+           last_nextKey: map<HostId, Key>;
+           last_nextDst: map<HostId, HostId>)
+  returns (nw_send: Option<Message>;
+           keys: map<HostId, map<Key, Entry>>;
+           nextKey: map<HostId, Key>;
+           nextDst: map<HostId, HostId>);
+var host_keys: map<Key, Entry>;
+var host_nextKey: Key;
+var host_nextDst: HostId;
+let
+  nw_send, host_keys, host_nextKey, host_nextDst =
+    Host(id, nw_recv, last_keys[id], last_nextKey[id], last_nextDst[id]);
+  keys = last_keys[id := host_keys];
+  nextKey = last_nextKey[id := host_nextKey];
+  nextDst = last_nextDst[id := host_nextDst];
+tel
+
+node DistributedSystem() returns (
+  myKeys: map<HostId, map<Key, Entry>>
+);
+(*@contract
+  guarantee "Safety: each key is live at no more than one host"
+    forall (i: HostId) forall (j: HostId) forall (k: Key)
+      ((myKeys[i][k]).live and (myKeys[j][k]).live) => i = j;
+*)
+var tk_holder: Option<HostId>;
+var host_send: Option<Message>;
+var nextKeyToSend: map<HostId, Key>;
+var nextDst: map<HostId, HostId>;
+var network_send, network_recv: Option<Message>;
+var sentMsgs: MsgSet; -- probe
+
+let
+  tk_holder = any { tk : Option<HostId> | None?(tk) -> Some?(tk) };
+
+  frame (host_send, myKeys, nextKeyToSend, nextDst)
+    host_send = None@<Message>;
+    myKeys = InitKeys;
+    nextKeyToSend = InitNextKey;
+    nextDst = InitNextDst;
+  let
+    when (Some?(tk_holder)) then
+      host_send, myKeys, nextKeyToSend, nextDst =
+        Hosts(tk_holder.value, network_recv,
+              last myKeys, last nextKeyToSend, last nextDst);
+    end
+  tel
+
+  if Some?(tk_holder) then
+    network_send = host_send;
+  else -- no one's turn
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs = Network(network_send);
+
+  check "At Most One Reconf In Flight Per Key"
+    forall (m1: Message) forall (m2: Message)
+      ((m1 in sentMsgs) and (m2 in sentMsgs) and (m1.key = m2.key) and
+       KeyInFlight(myKeys, m1) and KeyInFlight(myKeys, m2))
+      => m1 = m2;
+
+  check "Live Key Implies No Reconf In Flight"
+    forall (i: HostId) forall (m: Message)
+      ((myKeys[i][m.key]).live and (m in sentMsgs)) =>
+        not KeyInFlight(myKeys, m);
+
+  check "Next Key To Send Is Live"
+    forall (i: HostId) (myKeys[i][nextKeyToSend[i]]).live;
+tel
