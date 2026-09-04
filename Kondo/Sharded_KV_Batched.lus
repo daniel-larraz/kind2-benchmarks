@@ -110,16 +110,22 @@ let
 
   -- Post-state of a receive. A key becomes live with the version carried by
   -- the message when it is in flight for this host. Every other key is
-  -- marked NOT live and keeps its version, exactly as in hosts.dfy.
-  -- (The Dafny model most likely meant to leave the other keys unchanged.
-  -- For that reading replace `not (m[k]).live` in the else branch by
-  -- `(m[k]).live = (last_keys[k]).live`.)
+  -- left unchanged.
+  --
+  -- This deliberately departs from hosts.dfy, whose NextReceiveStep marks
+  -- every key that is not in flight as NOT live (`Entry(false, ...)` in the
+  -- else branch of its map comprehension). That makes a host lose all of
+  -- its live keys, including nextKeysToSend, on its first receive, after
+  -- which it can never send again. The Dafny model almost certainly meant
+  -- to keep those keys as they were, which is what is modeled here. For
+  -- the literal reading replace `(m[k]).live = (last_keys[k]).live` in
+  -- the else branch by `not (m[k]).live`.
   recv_keys = any { m: map<Key, Entry> |
     forall (k: Key) (k in m) and
       (if (((recv_msg.dst = id) and (k in recv_msg.vks)) and then
            ((last_keys[k]).version < recv_msg.vks[k]))
        then ((m[k]).live and ((m[k]).version = recv_msg.vks[k]))
-       else ((not (m[k]).live) and
+       else (((m[k]).live = (last_keys[k]).live) and
              ((m[k]).version = (last_keys[k]).version))) };
 
   -- Send step (SendReconf). The batch maps every key in nextKeysToSend to
@@ -249,6 +255,12 @@ let
       ((myKeys[h][k]).live and (0 <= i) and (i < numSent)) =>
         not KeyInFlight(myKeys, sentMsgs[i], k);
 
+  -- Dafny's HasLiveKeySet(nextKeysToSend) minus non-emptiness: adding the
+  -- `forall h exists k` conjunct makes kind2c stall on every property.
+  check "Next Keys To Send Are Live"
+    forall (h: HostId) forall (k: Key)
+      (k in nextKeysToSend[h]) => (myKeys[h][k]).live;
+
   --%MAIN;
 tel
 
@@ -258,11 +270,9 @@ tel
 -- four keys suffice for every property below. See Sharded_KV.lus for why
 -- the abstract types defeat bounded model checking here.
 --
--- Two properties of Sharded_KV.lus have no counterpart here because they
--- are unreachable in this model: a key is never transferred a second time,
--- and a key never returns to its initial owner. Receiving a message marks
--- every key that is not in flight as not live, so after its first receive
--- a host's nextKeysToSend are dead and it can never send again.
+-- The last two properties need traces of four and five steps, so they are
+-- the slowest to witness. Both are unreachable under the literal reading
+-- of hosts.dfy discussed in the Host node.
 node Reachability_Properties() returns (
   myKeys: map<HostId, map<Key, Entry>>;
   nextKeysToSend: map<HostId, KeySet>;
@@ -314,4 +324,15 @@ let
   check reachable "A host sends a reconf to itself"
     exists (i: int)
       (0 <= i) and (i < numSent) and (sentMsgs[i].src = sentMsgs[i].dst);
+
+  check reachable "A key is transferred a second time"
+    exists (i: int) exists (k: Key)
+      (0 <= i) and (i < numSent) and (k in sentMsgs[i].vks) and
+      (sentMsgs[i].vks[k] > 1);
+
+  check reachable "A key returns to its initial owner after another host sent it"
+    exists (h: HostId) exists (i: int) exists (k: Key)
+      (0 <= i) and (i < numSent) and (k in sentMsgs[i].vks) and
+      (sentMsgs[i].src <> h) and
+      (InitKeys[h][k]).live and (myKeys[h][k]).live;
 tel
