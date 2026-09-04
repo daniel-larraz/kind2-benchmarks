@@ -3,8 +3,10 @@ type VersionId = int;
 datatype Option<T> = Some (value: T) | None;
 
 type HostId;
+-- type HostId = enum {H1, H2};
 
 type Key = int;
+-- type Key = enum {K1, K2, K3};
 
 datatype Entry = Entry (live: bool, version: VersionId);
 
@@ -123,19 +125,14 @@ let
 tel
 
 node DistributedSystem() returns (
-  myKeys: map<HostId, map<Key, Entry>>
+  myKeys: map<HostId, map<Key, Entry>>;
+  nextKeyToSend: map<HostId, Key>;
+  nextDst: map<HostId, HostId>;
+  sentMsgs: MsgSet
 );
-(*@contract
-  guarantee "Safety: each key is live at no more than one host"
-    forall (i: HostId) forall (j: HostId) forall (k: Key)
-      ((myKeys[i][k]).live and (myKeys[j][k]).live) => i = j;
-*)
 var tk_holder: Option<HostId>;
 var host_send: Option<Message>;
-var nextKeyToSend: map<HostId, Key>;
-var nextDst: map<HostId, HostId>;
 var network_send, network_recv: Option<Message>;
-var sentMsgs: MsgSet; -- probe
 
 let
   tk_holder = any { tk : Option<HostId> | None?(tk) -> Some?(tk) };
@@ -160,6 +157,21 @@ let
   fi
 
   network_recv, sentMsgs = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  myKeys: map<HostId, map<Key, Entry>>;
+  nextKeyToSend: map<HostId, Key>;
+  nextDst: map<HostId, HostId>;
+  sentMsgs: MsgSet
+);
+(*@contract
+  guarantee "Safety: each key is live at no more than one host"
+    forall (i: HostId) forall (j: HostId) forall (k: Key)
+      ((myKeys[i][k]).live and (myKeys[j][k]).live) => i = j;
+*)
+let
+  myKeys, nextKeyToSend, nextDst, sentMsgs = DistributedSystem();
 
   check "At Most One Reconf In Flight Per Key"
     forall (m1: Message) forall (m2: Message)
@@ -174,4 +186,71 @@ let
 
   check "Next Key To Send Is Live"
     forall (i: HostId) (myKeys[i][nextKeyToSend[i]]).live;
+
+  --%MAIN;
+tel
+
+-- Witnesses for these properties are only found when HostId and Key are
+-- instantiated with finite enumerations: uncomment the alternative
+-- declarations of those two types near the top of the file. Two hosts and
+-- three keys suffice for every property below. With both types left
+-- abstract, bounded model checking never gets past the initial state: the
+-- solver has to build a model of the initial map of maps together with one
+-- transition, and it does not terminate on that query. The invariant proof
+-- in Invariant_Properties does not have that problem, since it only needs
+-- unsatisfiability, and it is carried out over the abstract types.
+--
+-- The last property needs a trace of six steps, so it is the slowest to
+-- witness.
+node Reachability_Properties() returns (
+  myKeys: map<HostId, map<Key, Entry>>;
+  nextKeyToSend: map<HostId, Key>;
+  nextDst: map<HostId, HostId>;
+  sentMsgs: MsgSet
+);
+let
+  myKeys, nextKeyToSend, nextDst, sentMsgs = DistributedSystem();
+
+  check reachable "A reconf msg is sent"
+    exists (m: Message) m in sentMsgs;
+
+  check reachable "A reconf is in flight"
+    exists (m: Message) (m in sentMsgs) and KeyInFlight(myKeys, m);
+
+  check reachable "A key is in transit, so no host holds it live"
+    exists (m: Message) (m in sentMsgs) and KeyInFlight(myKeys, m) and
+      (forall (i: HostId) not (myKeys[i][m.key]).live);
+
+  check reachable "A host holds a key it did not start with"
+    exists (i: HostId) exists (k: Key)
+      (myKeys[i][k]).live and (not (InitKeys[i][k]).live);
+
+  check reachable "A host updates its next key to send"
+    exists (i: HostId) nextKeyToSend[i] <> InitNextKey[i];
+
+  check reachable "A reconf goes stale"
+    exists (m: Message) (m in sentMsgs) and (not KeyInFlight(myKeys, m));
+
+  check reachable "Two different reconf msgs are sent"
+    exists (m1: Message) exists (m2: Message)
+      (m1 in sentMsgs) and (m2 in sentMsgs) and (m1 <> m2);
+
+  check reachable "Two different keys are reconfigured"
+    exists (m1: Message) exists (m2: Message)
+      (m1 in sentMsgs) and (m2 in sentMsgs) and (m1.key <> m2.key);
+
+  check reachable "Two different hosts send a reconf"
+    exists (m1: Message) exists (m2: Message)
+      (m1 in sentMsgs) and (m2 in sentMsgs) and (m1.src <> m2.src);
+
+  check reachable "A host sends a reconf to itself"
+    exists (m: Message) (m in sentMsgs) and (m.src = m.dst);
+
+  check reachable "A key is transferred a second time"
+    exists (m: Message) (m in sentMsgs) and (m.version > 1);
+
+  check reachable "A key returns to its initial owner after another host sent it"
+    exists (i: HostId) exists (m: Message)
+      (InitKeys[i][m.key]).live and (myKeys[i][m.key]).live and
+      (m in sentMsgs) and (m.src <> i);
 tel
