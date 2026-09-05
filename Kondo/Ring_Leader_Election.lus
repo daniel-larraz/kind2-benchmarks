@@ -1,0 +1,256 @@
+datatype Option<T> = Some (value: T) | None;
+
+node imported nondet() returns (r: bool);
+
+-- Hosts are arranged in a ring and identified by their ring position,
+-- 0 .. N-1. Each host also carries a unique (natural) host id, and the
+-- host with the largest id must be the only one to elect itself leader.
+type RingPos = int;
+type HostId = int;
+
+-- Number of hosts in the ring
+const N : subtype { n : int | n > 0 };
+-- const N : int = 3;
+
+transparent function ValidIdx(i: RingPos) returns (r: bool);
+let
+  r = (0 <= i) and (i < N);
+tel
+
+transparent function Successor(i: RingPos) returns (r: RingPos);
+let
+  r = if i = N - 1 then 0 else i + 1;
+tel
+
+transparent function Predecessor(i: RingPos) returns (r: RingPos);
+let
+  r = if i = 0 then N - 1 else i - 1;
+tel
+
+transparent function max(x: int; y: int) returns (r: int);
+let
+  r = if x > y then x else y;
+tel
+
+-- Dafny's Between: x lies strictly inside the clockwise arc from start
+-- to end. When start = end the arc is the whole ring minus start.
+transparent function Between(start: RingPos; x: RingPos; stop: RingPos)
+  returns (r: bool);
+let
+  r = if start < stop then (start < x) and (x < stop)
+      else (x < stop) or (start < x);
+tel
+
+-- Host ids, indexed by ring position: natural numbers, pairwise distinct
+-- over the valid positions.
+const HostIds : subtype { m : map<RingPos, HostId> |
+  (forall (i: RingPos) (0 <= i and i < N) => (i in m and m[i] >= 0))
+  and
+  (forall (i: RingPos) forall (j: RingPos)
+    (0 <= i and i < N and 0 <= j and j < N and m[i] = m[j]) => i = j) };
+-- const HostIds : map<RingPos, HostId> = map[0 := 1; 1 := 2; 2 := 0];
+
+-- Initially no host has heard anything
+const InitHighestHeard : subtype { m : map<RingPos, int> |
+  forall (i: RingPos) i in m and m[i] = -1 };
+-- const InitHighestHeard : map<RingPos, int> = map[0 := -1; 1 := -1; 2 := -1];
+
+datatype Message = Msg (val: int, src: RingPos);
+
+type MsgSet = set<Message>;
+
+transparent function IsLeader(highestHeard: map<RingPos, int>; i: RingPos)
+  returns (r: bool);
+let
+  r = highestHeard[i] = HostIds[i];
+tel
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  frame (sentMsgs)
+    sentMsgs = {}@<Message>;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs + {send.value};
+    end
+  tel
+  recv = any { m: Option<Message> | Some?(m) ==> m.value in prevSentMsgs };
+tel
+
+node Host(pos: RingPos; nw_recv: Option<Message>; last_highestHeard: int)
+  returns (nw_send: Option<Message>; highestHeard: int);
+var recv_msg, send_msg: bool;
+let
+  -- receive step: accept a larger value coming from my ring predecessor
+  recv_msg = Some?(nw_recv) and then
+             ((last_highestHeard < nw_recv.value.val) and
+              ValidIdx(nw_recv.value.src) and
+              (pos = Successor(nw_recv.value.src)));
+
+  -- transmission step: forward the max of what I heard and my own id
+  send_msg = None?(nw_recv) and nondet();
+
+  nw_send = if send_msg
+            then Some(Msg(max(last_highestHeard, HostIds[pos]), pos))
+            else None@<Message>;
+
+  highestHeard = when recv_msg then nw_recv.value.val
+                 else last_highestHeard;
+tel
+
+node Hosts(pos: RingPos; nw_recv: Option<Message>;
+           last_highestHeard: map<RingPos, int>)
+  returns (nw_send: Option<Message>; highestHeard: map<RingPos, int>);
+var hh: int;
+let
+  nw_send, hh = Host(pos, nw_recv, last_highestHeard[pos]);
+  highestHeard = last_highestHeard[pos := hh];
+tel
+
+node DistributedSystem() returns (
+  highestHeard: map<RingPos, int>;
+  sentMsgs: MsgSet
+);
+var tk_holder: Option<RingPos>;
+var host_send: Option<Message>;
+var network_send, network_recv: Option<Message>;
+let
+  tk_holder = any { tk : Option<RingPos> |
+                    (None?(tk) -> Some?(tk)) and
+                    (Some?(tk) ==> ValidIdx(tk.value)) };
+
+  frame (host_send, highestHeard)
+    host_send = None@<Message>;
+    highestHeard = InitHighestHeard;
+  let
+    when (Some?(tk_holder)) then
+      host_send, highestHeard =
+        Hosts(tk_holder.value, network_recv, last highestHeard);
+    end
+  tel
+
+  if Some?(tk_holder) then
+    network_send = host_send;
+  else -- no one's turn
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  highestHeard: map<RingPos, int>;
+  sentMsgs: MsgSet
+);
+(*@contract
+  guarantee "Safety: at most one leader"
+    forall (i: RingPos) forall (j: RingPos)
+      (ValidIdx(i) and ValidIdx(j) and
+       IsLeader(highestHeard, i) and IsLeader(highestHeard, j))
+      => i = j;
+*)
+let
+  highestHeard, sentMsgs = DistributedSystem();
+
+  -- Message invariants (Kondo's auto-generated ones)
+
+  check "Msg Valid Src"
+    forall (m: Message) (m in sentMsgs) => ValidIdx(m.src);
+
+  check "Receive Validity"
+    forall (i: RingPos)
+      (ValidIdx(i) and (highestHeard[i] >= 0)) =>
+        Msg(highestHeard[i], Predecessor(i)) in sentMsgs;
+
+  -- Application invariants
+
+  check "Payload Geq Sender HostId"
+    forall (m: Message) (m in sentMsgs) => m.val >= HostIds[m.src];
+
+  check "Sent Not My Id Implies Received Id"
+    forall (m: Message)
+      ((m in sentMsgs) and (m.val <> HostIds[m.src])) =>
+        Msg(m.val, Predecessor(m.src)) in sentMsgs;
+
+  -- Message-level chord dominance. A message carrying host src's id that
+  -- was sent by host m.src has travelled clockwise from src to m.src, and
+  -- every host on that arc (excluding src, including m.src) has a smaller
+  -- id. Unlike Dafny's ChordDominatesMsgs this is stated on the message
+  -- rather than on the receiver's state, which makes it inductive in one
+  -- step: a send at position s either carries s's own id (empty arc) or
+  -- forwards a value received from Predecessor(s), whose own message
+  -- covers the arc up to Predecessor(s).
+  check "Msg Chord Dominates"
+    forall (m: Message) forall (src: RingPos) forall (mid: RingPos)
+      ((m in sentMsgs) and ValidIdx(src) and ValidIdx(mid) and
+       (HostIds[src] = m.val) and Between(src, mid, Successor(m.src)))
+      => HostIds[mid] < m.val;
+
+  check "Chord Dominates"
+    forall (src: RingPos) forall (dst: RingPos) forall (mid: RingPos)
+      (ValidIdx(src) and ValidIdx(dst) and ValidIdx(mid) and
+       (highestHeard[dst] = HostIds[src]) and Between(src, mid, dst))
+      => HostIds[mid] < HostIds[src];
+
+  --%MAIN;
+tel
+
+-- Witnesses for these properties are only found when the ring is
+-- instantiated concretely: uncomment the alternative declarations of N,
+-- HostIds and InitHighestHeard near the top of the file (and comment out the
+-- symbolic ones). A ring of three hosts suffices for every property below.
+-- With the symbolic declarations, bounded model checking does not get past
+-- the initial state: the solver has to build a model of the quantified
+-- constraints on the two constant maps together with a few transitions, and
+-- it does not terminate on those queries. The invariant proof in
+-- Invariant_Properties does not have that problem, since it only needs
+-- unsatisfiability, and it is carried out for any ring size and any
+-- assignment of distinct host ids.
+--
+-- The last three properties need a trace of six steps, so they are the
+-- slowest to witness.
+node Reachability_Properties() returns (
+  highestHeard: map<RingPos, int>;
+  sentMsgs: MsgSet
+);
+let
+  highestHeard, sentMsgs = DistributedSystem();
+
+  check reachable "A msg is sent"
+    exists (m: Message) m in sentMsgs;
+
+  check reachable "A host hears a value"
+    exists (i: RingPos) ValidIdx(i) and (highestHeard[i] >= 0);
+
+  check reachable "A host hears a value larger than its own id"
+    exists (i: RingPos) ValidIdx(i) and (highestHeard[i] > HostIds[i]);
+
+  check reachable "A host forwards a value it heard rather than its own id"
+    exists (m: Message) (m in sentMsgs) and (m.val <> HostIds[m.src]);
+
+  check reachable "A host hears a value that did not come from its predecessor's id"
+    exists (i: RingPos) ValidIdx(i) and (highestHeard[i] >= 0) and
+      (highestHeard[i] <> HostIds[Predecessor(i)]);
+
+  check reachable "A leader is elected"
+    exists (i: RingPos) ValidIdx(i) and IsLeader(highestHeard, i);
+
+  check reachable "A leader is elected in a ring with more than one host"
+    (N > 1) and (exists (i: RingPos) ValidIdx(i) and IsLeader(highestHeard, i));
+
+  check reachable "A leader is elected in a ring with more than two hosts"
+    (N > 2) and (exists (i: RingPos) ValidIdx(i) and IsLeader(highestHeard, i));
+
+  check reachable "Two different hosts hear a value"
+    exists (i: RingPos) exists (j: RingPos)
+      ValidIdx(i) and ValidIdx(j) and (i <> j) and
+      (highestHeard[i] >= 0) and (highestHeard[j] >= 0);
+
+  check reachable "A host raises its highest heard value twice"
+    exists (i: RingPos) exists (m: Message)
+      ValidIdx(i) and (m in sentMsgs) and (m.src = Predecessor(i)) and
+      (0 <= m.val) and (m.val < highestHeard[i]);
+tel
