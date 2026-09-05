@@ -1,0 +1,250 @@
+datatype Option<T> = Some (value: T) | None;
+
+type HostId;
+-- type HostId = enum {H1, H2, H3};
+
+type IdSet = set<HostId>;
+
+datatype Message =
+  | VoteReq (candidate: HostId)
+  | Vote (voter: HostId, cand: HostId);
+
+type MsgSet = set<Message>;
+
+-- The steps a host may take when it is not receiving a message
+type Step = enum {NominateSelf, SendVoteReq, SendVote, Victory, Stutter};
+
+-- Initial per-host state: no votes, no nominee, not a leader
+const InitVotes : subtype { m : map<HostId, IdSet> |
+  forall (h: HostId) h in m and (forall (v: HostId) not (v in m[h])) };
+
+const InitNominee : subtype { m : map<HostId, Option<HostId>> |
+  forall (h: HostId) h in m and None?(m[h]) };
+
+const InitLeader : subtype { m : map<HostId, bool> |
+  forall (h: HostId) h in m and not m[h] };
+
+-- Quorums. Kind 2 has no set cardinality, so Dafny's
+-- SetIsQuorum(clusterSize, receivedVotes), |receivedVotes| > clusterSize/2,
+-- is abstracted by a per-host oracle: hasQuorum[h] says whether host h's
+-- received votes currently form a quorum. The oracle is only constrained by
+-- the two facts the Dafny proof uses about majorities: two quorums of the
+-- same cluster intersect (which for i = j also makes a quorum non-empty),
+-- and a quorum of a growing set stays a quorum. Every run of the concrete
+-- protocol is a run of this abstraction, so the invariants proved here hold
+-- for the concrete protocol too.
+const NoQuorum : subtype { m : map<HostId, bool> |
+  forall (h: HostId) h in m and not m[h] };
+
+node Network(send: Option<Message>) returns
+  (recv: Option<Message>; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  frame (sentMsgs)
+    sentMsgs = {}@<Message>;
+  let
+    when Some?(send) then
+      sentMsgs = prevSentMsgs + {send.value};
+    end
+  tel
+  recv = any { m: Option<Message> | Some?(m) ==> m.value in prevSentMsgs };
+tel
+
+node Host(id: HostId; nw_recv: Option<Message>; hasQuorum: bool;
+          last_votes: IdSet; last_nominee: Option<HostId>;
+          last_isLeader: bool)
+  returns (nw_send: Option<Message>; votes: IdSet;
+           nominee: Option<HostId>; isLeader: bool);
+var step: Step;
+var recv_votereq, recv_vote: bool;
+var nominate, send_votereq, send_vote, victory: bool;
+let
+  -- which non-receiving step to attempt
+  step = any@<Step>;
+
+  -- receive steps
+  recv_votereq = Some?(nw_recv) and then VoteReq?(nw_recv.value)
+                 and None?(last_nominee);
+
+  recv_vote = Some?(nw_recv) and then Vote?(nw_recv.value)
+              and then (nw_recv.value.cand = id);
+
+  -- internal and send steps
+  nominate = None?(nw_recv) and (step = NominateSelf) and None?(last_nominee);
+
+  send_votereq = None?(nw_recv) and (step = SendVoteReq) and
+                 Some?(last_nominee) and then (last_nominee.value = id);
+
+  send_vote = None?(nw_recv) and (step = SendVote) and Some?(last_nominee);
+
+  victory = None?(nw_recv) and (step = Victory) and hasQuorum;
+
+  nw_send = when send_vote then Some(Vote(id, last_nominee.value))
+            else (if send_votereq then Some(VoteReq(id)) else None@<Message>);
+
+  nominee = when recv_votereq then Some(nw_recv.value.candidate)
+            else (if nominate then Some(id) else last_nominee);
+
+  votes = when recv_vote then last_votes + {nw_recv.value.voter}
+          else last_votes;
+
+  isLeader = if victory then true else last_isLeader;
+tel
+
+node Hosts(id: HostId; nw_recv: Option<Message>; hasQuorum: bool;
+           last_votes: map<HostId, IdSet>;
+           last_nominee: map<HostId, Option<HostId>>;
+           last_isLeader: map<HostId, bool>)
+  returns (nw_send: Option<Message>;
+           votes: map<HostId, IdSet>;
+           nominee: map<HostId, Option<HostId>>;
+           isLeader: map<HostId, bool>);
+var host_votes: IdSet;
+var host_nominee: Option<HostId>;
+var host_isLeader: bool;
+let
+  nw_send, host_votes, host_nominee, host_isLeader =
+    Host(id, nw_recv, hasQuorum,
+         last_votes[id], last_nominee[id], last_isLeader[id]);
+  votes = last_votes[id := host_votes];
+  nominee = last_nominee[id := host_nominee];
+  isLeader = last_isLeader[id := host_isLeader];
+tel
+
+node DistributedSystem() returns (
+  receivedVotes: map<HostId, IdSet>;
+  nominee: map<HostId, Option<HostId>>;
+  isLeader: map<HostId, bool>;
+  hasQuorum: map<HostId, bool>;
+  sentMsgs: MsgSet
+);
+var tk_holder: Option<HostId>;
+var host_send: Option<Message>;
+var network_send, network_recv: Option<Message>;
+var prevHasQuorum: map<HostId, bool>;
+let
+  tk_holder = any { tk : Option<HostId> | None?(tk) -> Some?(tk) };
+
+  -- the quorum oracle is evaluated on the state reached at the end of the
+  -- previous step, which is the state the host is stepping from
+  prevHasQuorum = NoQuorum -> pre hasQuorum;
+
+  frame (host_send, receivedVotes, nominee, isLeader)
+    host_send = None@<Message>;
+    receivedVotes = InitVotes;
+    nominee = InitNominee;
+    isLeader = InitLeader;
+  let
+    when (Some?(tk_holder)) then
+      host_send, receivedVotes, nominee, isLeader =
+        Hosts(tk_holder.value, network_recv, prevHasQuorum[tk_holder.value],
+              last receivedVotes, last nominee, last isLeader);
+    end
+  tel
+
+  hasQuorum = any { q : map<HostId, bool> |
+    (forall (h: HostId) h in q)
+    and
+    (forall (h: HostId) prevHasQuorum[h] => q[h])
+    and
+    (forall (i: HostId) forall (j: HostId)
+      (q[i] and q[j]) =>
+        (exists (v: HostId) (v in receivedVotes[i]) and (v in receivedVotes[j]))) };
+
+  if Some?(tk_holder) then
+    network_send = host_send;
+  else -- no one's turn
+    network_send = None@<Message>;
+  fi
+
+  network_recv, sentMsgs = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  receivedVotes: map<HostId, IdSet>;
+  nominee: map<HostId, Option<HostId>>;
+  isLeader: map<HostId, bool>;
+  hasQuorum: map<HostId, bool>;
+  sentMsgs: MsgSet
+);
+(*@contract
+  guarantee "Safety: at most one leader"
+    forall (i: HostId) forall (j: HostId)
+      (isLeader[i] and isLeader[j]) => i = j;
+*)
+let
+  receivedVotes, nominee, isLeader, hasQuorum, sentMsgs = DistributedSystem();
+
+  -- Message invariants
+
+  check "Received Votes Validity"
+    forall (h: HostId) forall (v: HostId)
+      (v in receivedVotes[h]) => Vote(v, h) in sentMsgs;
+
+  check "Vote Msg Implies Nominee"
+    forall (m: Message)
+      ((m in sentMsgs) and Vote?(m)) ==> nominee[m.voter] = Some(m.cand);
+
+  -- Application invariants
+
+  check "Has Vote Implies Voter Nominates"
+    forall (h: HostId) forall (v: HostId)
+      (v in receivedVotes[h]) => nominee[v] = Some(h);
+
+  check "Is Leader Implies Has Quorum"
+    forall (h: HostId) isLeader[h] => hasQuorum[h];
+
+  --%MAIN;
+tel
+
+-- Witnesses for these properties are only found when HostId is instantiated
+-- with a finite enumeration: uncomment the alternative declaration of the
+-- type near the top of the file. See Sharded_KV.lus for why the abstract
+-- type defeats bounded model checking here.
+node Reachability_Properties() returns (
+  receivedVotes: map<HostId, IdSet>;
+  nominee: map<HostId, Option<HostId>>;
+  isLeader: map<HostId, bool>;
+  hasQuorum: map<HostId, bool>;
+  sentMsgs: MsgSet
+);
+let
+  receivedVotes, nominee, isLeader, hasQuorum, sentMsgs = DistributedSystem();
+
+  check reachable "A host nominates itself"
+    exists (h: HostId) nominee[h] = Some(h);
+
+  check reachable "A vote request is sent"
+    exists (m: Message) (m in sentMsgs) and VoteReq?(m);
+
+  check reachable "A host nominates another host"
+    exists (h: HostId) exists (c: HostId) (h <> c) and (nominee[h] = Some(c));
+
+  check reachable "A vote is sent"
+    exists (m: Message) (m in sentMsgs) and Vote?(m);
+
+  check reachable "A host receives a vote from itself"
+    exists (h: HostId) h in receivedVotes[h];
+
+  check reachable "A host receives a vote from another host"
+    exists (h: HostId) exists (v: HostId) (h <> v) and (v in receivedVotes[h]);
+
+  check reachable "A host receives votes from two different hosts"
+    exists (h: HostId) exists (v1: HostId) exists (v2: HostId)
+      (v1 <> v2) and (v1 in receivedVotes[h]) and (v2 in receivedVotes[h]);
+
+  check reachable "A host has a quorum"
+    exists (h: HostId) hasQuorum[h];
+
+  check reachable "A leader is elected"
+    exists (h: HostId) isLeader[h];
+
+  check reachable "A leader is elected with a vote from another host"
+    exists (h: HostId) exists (v: HostId)
+      isLeader[h] and (h <> v) and (v in receivedVotes[h]);
+
+  check reachable "Two hosts nominate different candidates"
+    exists (h1: HostId) exists (h2: HostId)
+      Some?(nominee[h1]) and Some?(nominee[h2]) and (nominee[h1] <> nominee[h2]);
+tel
