@@ -1,0 +1,680 @@
+-- Verification. All properties of Invariant_Properties are valid by
+-- 1-induction for any number of acceptors, learners and values, and for the
+-- fixed number of leaders NL below (checked with NL = 3, 4 and 5), with
+--
+--   kind2 --smt_solver cvc5 --cvc5_mbqi false --ind_split_props true Paxos.lus
+--
+-- The two flags are additions to Kind 2 made for these models: cvc5 without
+-- model-based quantifier instantiation refutes the step queries at once
+-- where it otherwise gives up on them, and the inductive step checking the
+-- properties one at a time, in the order written and using the earlier
+-- ones as lemmas, is what keeps every query small. With NL left symbolic
+-- (the commented declaration) every property up to and including the
+-- own-quorum lemmas is still proved the same way, but the step of Safe At
+-- does not return: a symbolic bound on an integer-indexed chain together
+-- with the abstract sorts is beyond the instantiation heuristics of both
+-- Z3 and cvc5, although each ingredient alone costs a few seconds.
+--
+-- Leaders are identified by their ballot: leader b proposes at ballot b.
+-- Ballots are compared, so LeaderId is an integer, 0 .. NL-1. The absent
+-- ballot (Dafny's MNNone / None) is encoded as -1.
+type LeaderId = int;
+
+type AcceptorId;
+-- type AcceptorId = enum {A1, A2, A3};
+
+type LearnerId;
+-- type LearnerId = enum {L1, L2};
+
+type Value;
+-- type Value = enum {V1, V2};
+
+-- Number of leaders (ballots); see the note on verification above
+const NL : int = 3;
+-- const NL : subtype { n : int | n > 0 };
+
+transparent function ValidLeaderIdx(b: LeaderId) returns (r: bool);
+let
+  r = (0 <= b) and (b < NL);
+tel
+
+-- The value carried by a promise that reports no accepted value-ballot
+-- pair, so that such promises have a single representation
+const NoValue : Value;
+
+-- Messages. Dafny's Promise(bal, acc, vbOpt) carries an optional
+-- value-ballot pair; here the option is flattened into a flag and the two
+-- components, which hold NoValue and -1 when the flag is false. NoMsg stands
+-- for the absence of a message on the wire.
+datatype Message =
+  | Prepare (prepBal: LeaderId)
+  | Promise (promBal: LeaderId, promAcc: AcceptorId,
+             promHasVB: bool, promVal: Value, promVBal: LeaderId)
+  | Propose (propBal: LeaderId, propVal: Value)
+  | Accept (accVal: Value, accBal: LeaderId, accAcc: AcceptorId)
+  | NoMsg;
+
+type MsgSet = set<Message>;
+
+-- The state of the hosts is kept in flat relations and maps rather than in
+-- per-host records: (b, a) in promises says that leader b received a
+-- promise from acceptor a, and (l, v, b, a) in accepts says that learner l
+-- received an Accept for (v, b) from acceptor a. Every such structure is a
+-- single array for the solver, which keeps the number of quantified array
+-- axioms in the transition relation small.
+type PromiseRel = set<[LeaderId, AcceptorId]>;
+type AcceptRel = set<[LearnerId, Value, LeaderId, AcceptorId]>;
+
+-- Quorum oracles, see below
+type P1Set = set<LeaderId>;
+type P2Set = set<[LearnerId, Value, LeaderId]>;
+
+-- The steps a host may take when it is not receiving a message
+type LeaderStep = enum {SendPrepare, SendPropose, LeaderStutter};
+type AcceptorStep = enum {MaybePromise, BroadcastAccepted, AcceptorStutter};
+type LearnerStep = enum {Learn, LearnerStutter};
+
+-- Each leader's preferred value
+const PreferredValue : map<LeaderId, Value>;
+-- const PreferredValue : map<LeaderId, Value> = map[0 := V1; 1 := V2];
+
+-- Initial leader state: no promises received, nothing heard
+const InitPromises : PromiseRel = {}@<[LeaderId, AcceptorId]>;
+
+const InitHighestHeard : subtype { m : map<LeaderId, LeaderId> |
+  forall (b: LeaderId) m[b] = -1 };
+-- const InitHighestHeard : map<LeaderId, LeaderId> = map[0 := -1; 1 := -1];
+
+-- Initial acceptor state: no pending prepare, nothing promised or accepted
+const InitBallots : subtype { m : map<AcceptorId, LeaderId> |
+  forall (a: AcceptorId) m[a] = -1 };
+
+const InitAcceptedVal : subtype { m : map<AcceptorId, Value> |
+  forall (a: AcceptorId) m[a] = NoValue };
+
+-- Initial learner state: no accepts received, nothing learned
+const InitAccepts : AcceptRel = {}@<[LearnerId, Value, LeaderId, AcceptorId]>;
+
+const InitLearned : map<LearnerId, Value>;
+
+const InitHasLearned : subtype { m : map<LearnerId, bool> |
+  forall (l: LearnerId) not m[l] };
+
+-- Quorums. The Dafny model has 2f+1 acceptors and a quorum is any f+1 of
+-- them: a leader proposes once it holds promises from f+1 acceptors, and a
+-- learner learns a value-ballot pair once f+1 acceptors accepted it. Kind 2
+-- has no set cardinality, so quorums are abstracted by two oracles:
+-- b in hasP1Quorum says that leader b's received promises form a quorum,
+-- and (l, v, b) in hasP2Quorum says that the acceptors learner l has seen
+-- accept (v, b) form a quorum. The oracles are only constrained by the
+-- facts the safety argument uses about majorities: any two quorums
+-- intersect, a quorum is non-empty, and a quorum of a growing set stays a
+-- quorum. Every run of the concrete protocol is a run of this abstraction,
+-- so the invariants proved here hold for the concrete protocol too.
+
+node Network(send: Message) returns (recv: Message; sentMsgs: MsgSet);
+var prevSentMsgs: MsgSet;
+let
+  prevSentMsgs = {}@<Message> -> pre sentMsgs;
+  sentMsgs = if NoMsg?(send) then prevSentMsgs else prevSentMsgs + {send};
+  recv = any { m: Message | (not NoMsg?(m)) => (m in prevSentMsgs) };
+tel
+
+node Leader(id: LeaderId; nw_recv: Message; hasP1Quorum: bool;
+            last_promises: PromiseRel;
+            last_value: map<LeaderId, Value>;
+            last_hh: map<LeaderId, LeaderId>)
+  returns (nw_send: Message; promises: PromiseRel;
+           ldrValue: map<LeaderId, Value>; hh: map<LeaderId, LeaderId>);
+var step: LeaderStep;
+var recv_promise, do_update, send_prepare, send_propose: bool;
+let
+  step = any@<LeaderStep>;
+
+  -- receive step: a promise for my ballot from a new acceptor, while I do
+  -- not have a quorum yet
+  recv_promise = Promise?(nw_recv) and then
+                 ((nw_recv.promBal = id) and (not hasP1Quorum) and
+                  (not ('(id, nw_recv.promAcc) in last_promises)));
+
+  -- adopt the promise's accepted value if its ballot beats what I heard
+  do_update = Promise?(nw_recv) and then
+              (recv_promise and nw_recv.promHasVB and
+               (last_hh[id] < nw_recv.promVBal));
+
+  send_prepare = NoMsg?(nw_recv) and (step = SendPrepare);
+
+  send_propose = NoMsg?(nw_recv) and (step = SendPropose) and
+                 hasP1Quorum and (last_hh[id] < id);
+
+  nw_send = if send_prepare then Prepare(id)
+            else if send_propose then Propose(id, last_value[id])
+            else NoMsg;
+
+  promises = when Promise?(nw_recv) and then recv_promise
+             then last_promises + { '(id, nw_recv.promAcc) }
+             else last_promises;
+
+  ldrValue = when Promise?(nw_recv) and then do_update
+             then last_value[id := nw_recv.promVal]
+             else last_value;
+
+  hh = when Promise?(nw_recv) and then do_update
+       then last_hh[id := nw_recv.promVBal]
+       else last_hh;
+tel
+
+node Acceptor(id: AcceptorId; nw_recv: Message;
+              last_pending: map<AcceptorId, LeaderId>;
+              last_promised: map<AcceptorId, LeaderId>;
+              last_accBal: map<AcceptorId, LeaderId>;
+              last_accVal: map<AcceptorId, Value>)
+  returns (nw_send: Message;
+           pending: map<AcceptorId, LeaderId>;
+           promised: map<AcceptorId, LeaderId>;
+           accBal: map<AcceptorId, LeaderId>;
+           accVal: map<AcceptorId, Value>);
+var step: AcceptorStep;
+var pend, prom, abal: LeaderId;
+var aval: Value;
+var recv_prepare, maybe_promise, do_promise: bool;
+var recv_propose, do_accept, broadcast: bool;
+let
+  step = any@<AcceptorStep>;
+
+  pend = last_pending[id];
+  prom = last_promised[id];
+  abal = last_accBal[id];
+  aval = last_accVal[id];
+
+  -- receive a prepare: park it until the next MaybePromise step
+  recv_prepare = Prepare?(nw_recv) and (pend = -1);
+
+  -- answer the pending prepare: promise if its ballot beats my promise
+  maybe_promise = NoMsg?(nw_recv) and (step = MaybePromise) and (pend >= 0);
+
+  do_promise = maybe_promise and (prom < pend);
+
+  -- receive a propose: accept it if its ballot is at least my promise
+  recv_propose = Propose?(nw_recv) and (pend = -1);
+
+  do_accept = Propose?(nw_recv) and then
+              (recv_propose and (prom <= nw_recv.propBal));
+
+  -- tell the learners what I accepted, if I still stand by it
+  broadcast = NoMsg?(nw_recv) and (step = BroadcastAccepted) and
+              (pend = -1) and (abal >= 0) and (prom = abal);
+
+  nw_send = if do_promise then
+              Promise(pend, id, abal >= 0,
+                      (if abal >= 0 then aval else NoValue), abal)
+            else if broadcast then Accept(aval, abal, id)
+            else NoMsg;
+
+  pending = when Prepare?(nw_recv) and then recv_prepare
+            then last_pending[id := nw_recv.prepBal]
+            else (if maybe_promise then last_pending[id := -1]
+                  else last_pending);
+
+  promised = when Propose?(nw_recv) and then do_accept
+             then last_promised[id := nw_recv.propBal]
+             else (if do_promise then last_promised[id := pend]
+                   else last_promised);
+
+  accBal = when Propose?(nw_recv) and then do_accept
+           then last_accBal[id := nw_recv.propBal]
+           else last_accBal;
+
+  accVal = when Propose?(nw_recv) and then do_accept
+           then last_accVal[id := nw_recv.propVal]
+           else last_accVal;
+tel
+
+node Learner(id: LearnerId; nw_recv: Message; hasP2Quorum: P2Set;
+             last_accepts: AcceptRel;
+             last_learned: map<LearnerId, Value>;
+             last_hasLearned: map<LearnerId, bool>)
+  returns (nw_send: Message; accepts: AcceptRel;
+           learned: map<LearnerId, Value>;
+           hasLearned: map<LearnerId, bool>);
+var step: LearnerStep;
+var learn_val: Value;
+var learn_bal: LeaderId;
+var learn: bool;
+let
+  step = any@<LearnerStep>;
+  learn_val = any@<Value>;
+  learn_bal = any@<LeaderId>;
+
+  -- learn a value-ballot pair accepted by a quorum
+  learn = NoMsg?(nw_recv) and (step = Learn) and
+          ('(id, learn_val, learn_bal) in hasP2Quorum);
+
+  nw_send = NoMsg;
+
+  accepts = when Accept?(nw_recv)
+            then last_accepts +
+                 { '(id, nw_recv.accVal, nw_recv.accBal, nw_recv.accAcc) }
+            else last_accepts;
+
+  learned = if learn then last_learned[id := learn_val] else last_learned;
+
+  hasLearned = if learn then last_hasLearned[id := true] else last_hasLearned;
+tel
+
+datatype Token_Holder =
+  | LeaderHost (ldr: LeaderId)
+  | AcceptorHost (acc: AcceptorId)
+  | LearnerHost (lnr: LearnerId)
+  | NoHost;
+
+node DistributedSystem() returns (
+  promises: PromiseRel;
+  ldrValue: map<LeaderId, Value>;
+  highestHeard: map<LeaderId, LeaderId>;
+  pendingPrepare: map<AcceptorId, LeaderId>;
+  promised: map<AcceptorId, LeaderId>;
+  acceptedBal: map<AcceptorId, LeaderId>;
+  acceptedVal: map<AcceptorId, Value>;
+  accepts: AcceptRel;
+  learned: map<LearnerId, Value>;
+  hasLearned: map<LearnerId, bool>;
+  hasP1Quorum: P1Set;
+  hasP2Quorum: P2Set;
+  sentMsgs: MsgSet
+);
+var tk_holder: Token_Holder;
+var ldr_id: LeaderId;
+var acc_id: AcceptorId;
+var lnr_id: LearnerId;
+var last_promises: PromiseRel;
+var last_value: map<LeaderId, Value>;
+var last_hh: map<LeaderId, LeaderId>;
+var last_pending, last_promised, last_accBal: map<AcceptorId, LeaderId>;
+var last_accVal: map<AcceptorId, Value>;
+var last_accepts: AcceptRel;
+var last_learned: map<LearnerId, Value>;
+var last_hasLearned: map<LearnerId, bool>;
+var prevP1Quorum: P1Set;
+var prevP2Quorum: P2Set;
+var l_send, a_send, r_send, network_send, network_recv: Message;
+var l_promises: PromiseRel;
+var l_value: map<LeaderId, Value>;
+var l_hh: map<LeaderId, LeaderId>;
+var a_pending, a_promised, a_accBal: map<AcceptorId, LeaderId>;
+var a_accVal: map<AcceptorId, Value>;
+var r_accepts: AcceptRel;
+var r_learned: map<LearnerId, Value>;
+var r_hasLearned: map<LearnerId, bool>;
+let
+  tk_holder = any { tk : Token_Holder |
+                    (tk = NoHost -> tk <> NoHost) and
+                    (LeaderHost?(tk) ==> ValidLeaderIdx(tk.ldr)) };
+
+  ldr_id = when LeaderHost?(tk_holder) then tk_holder.ldr else 0;
+  acc_id = when AcceptorHost?(tk_holder) then tk_holder.acc else any@<AcceptorId>;
+  lnr_id = when LearnerHost?(tk_holder) then tk_holder.lnr else any@<LearnerId>;
+
+  -- state the hosts are stepping from
+  last_promises = InitPromises -> pre promises;
+  last_value = PreferredValue -> pre ldrValue;
+  last_hh = InitHighestHeard -> pre highestHeard;
+  last_pending = InitBallots -> pre pendingPrepare;
+  last_promised = InitBallots -> pre promised;
+  last_accBal = InitBallots -> pre acceptedBal;
+  last_accVal = InitAcceptedVal -> pre acceptedVal;
+  last_accepts = InitAccepts -> pre accepts;
+  last_learned = InitLearned -> pre learned;
+  last_hasLearned = InitHasLearned -> pre hasLearned;
+
+  -- the quorum oracles are evaluated on the state reached at the end of
+  -- the previous step, which is the state the hosts are stepping from
+  prevP1Quorum = {}@<LeaderId> -> pre hasP1Quorum;
+  prevP2Quorum = {}@<[LearnerId, Value, LeaderId]> -> pre hasP2Quorum;
+
+  l_send, l_promises, l_value, l_hh =
+    Leader(ldr_id, network_recv, ldr_id in prevP1Quorum,
+           last_promises, last_value, last_hh);
+
+  a_send, a_pending, a_promised, a_accBal, a_accVal =
+    Acceptor(acc_id, network_recv,
+             last_pending, last_promised, last_accBal, last_accVal);
+
+  r_send, r_accepts, r_learned, r_hasLearned =
+    Learner(lnr_id, network_recv, prevP2Quorum,
+            last_accepts, last_learned, last_hasLearned);
+
+  -- the token holder steps, the other hosts keep their state; at the
+  -- first instant nobody steps and the state is the initial one
+  promises = if LeaderHost?(tk_holder) then l_promises else last_promises;
+  ldrValue = if LeaderHost?(tk_holder) then l_value else last_value;
+  highestHeard = if LeaderHost?(tk_holder) then l_hh else last_hh;
+
+  pendingPrepare = if AcceptorHost?(tk_holder) then a_pending else last_pending;
+  promised = if AcceptorHost?(tk_holder) then a_promised else last_promised;
+  acceptedBal = if AcceptorHost?(tk_holder) then a_accBal else last_accBal;
+  acceptedVal = if AcceptorHost?(tk_holder) then a_accVal else last_accVal;
+
+  accepts = if LearnerHost?(tk_holder) then r_accepts else last_accepts;
+  learned = if LearnerHost?(tk_holder) then r_learned else last_learned;
+  hasLearned = if LearnerHost?(tk_holder) then r_hasLearned else last_hasLearned;
+
+  -- Phase 1 quorums: a quorum of promises stays a quorum, and (both being
+  -- majorities) two of them intersect, which for b1 = b2 also makes a
+  -- quorum non-empty
+  hasP1Quorum = any { q : P1Set |
+    (forall (b: LeaderId) (b in prevP1Quorum) => (b in q))
+    and
+    (forall (b1: LeaderId) forall (b2: LeaderId)
+      ((b1 in q) and (b2 in q)) =>
+        (exists (a: AcceptorId)
+          ('(b1, a) in promises) and ('(b2, a) in promises))) };
+
+  -- Phase 2 quorums: a quorum of accepts is a non-empty set of acceptors
+  -- the learner has actually heard from, stays a quorum, intersects any
+  -- phase 1 quorum, and (both being majorities) intersects any other phase
+  -- 2 quorum
+  hasP2Quorum = any { q : P2Set |
+    (forall (b: LeaderId) forall (l: LearnerId) forall (v: Value)
+      ('(l, v, b) in prevP2Quorum) => ('(l, v, b) in q))
+    and
+    (forall (b: LeaderId) forall (l: LearnerId) forall (v: Value)
+      ('(l, v, b) in q) =>
+        (exists (a: AcceptorId) '(l, v, b, a) in accepts))
+    and
+    (forall (b1: LeaderId) forall (b: LeaderId)
+     forall (l: LearnerId) forall (v: Value)
+      ((b1 in hasP1Quorum) and ('(l, v, b) in q)) =>
+        (exists (a: AcceptorId)
+          ('(b1, a) in promises) and ('(l, v, b, a) in accepts)))
+    and
+    (forall (b1: LeaderId) forall (b2: LeaderId)
+     forall (l1: LearnerId) forall (l2: LearnerId)
+     forall (v1: Value) forall (v2: Value)
+      (('(l1, v1, b1) in q) and ('(l2, v2, b2) in q)) =>
+        (exists (a: AcceptorId)
+          ('(l1, v1, b1, a) in accepts) and ('(l2, v2, b2, a) in accepts))) };
+
+  network_send = if LeaderHost?(tk_holder) then l_send
+                 else if AcceptorHost?(tk_holder) then a_send
+                 else if LearnerHost?(tk_holder) then r_send
+                 else NoMsg;
+
+  network_recv, sentMsgs = Network(network_send);
+tel
+
+node Invariant_Properties() returns (
+  promises: PromiseRel;
+  ldrValue: map<LeaderId, Value>;
+  highestHeard: map<LeaderId, LeaderId>;
+  pendingPrepare: map<AcceptorId, LeaderId>;
+  promised: map<AcceptorId, LeaderId>;
+  acceptedBal: map<AcceptorId, LeaderId>;
+  acceptedVal: map<AcceptorId, Value>;
+  accepts: AcceptRel;
+  learned: map<LearnerId, Value>;
+  hasLearned: map<LearnerId, bool>;
+  hasP1Quorum: P1Set;
+  hasP2Quorum: P2Set;
+  sentMsgs: MsgSet
+);
+(*@contract
+  guarantee "Safety: all learners learn the same value"
+    forall (l1: LearnerId) forall (l2: LearnerId)
+      (hasLearned[l1] and hasLearned[l2]) => learned[l1] = learned[l2];
+*)
+let
+  promises, ldrValue, highestHeard, pendingPrepare, promised, acceptedBal,
+  acceptedVal, accepts, learned, hasLearned, hasP1Quorum, hasP2Quorum,
+  sentMsgs = DistributedSystem();
+
+  -- Well-formedness of the encoding
+
+  check "Valid Message Fields"
+    forall (m: Message) (m in sentMsgs) =>
+      ((Prepare?(m) ==> ValidLeaderIdx(m.prepBal)) and
+       (Promise?(m) ==>
+          (ValidLeaderIdx(m.promBal) and
+           (m.promHasVB => ValidLeaderIdx(m.promVBal)) and
+           ((not m.promHasVB) => ((m.promVBal = -1) and (m.promVal = NoValue))))) and
+       (Propose?(m) ==> ValidLeaderIdx(m.propBal)) and
+       (Accept?(m) ==> ValidLeaderIdx(m.accBal)) and
+       (not NoMsg?(m)));
+
+  check "Valid Ballot Fields"
+    (forall (b: LeaderId) ValidLeaderIdx(b) =>
+       ((highestHeard[b] = -1) or ValidLeaderIdx(highestHeard[b])))
+    and
+    (forall (a: AcceptorId)
+       ((pendingPrepare[a] = -1) or ValidLeaderIdx(pendingPrepare[a])) and
+       ((promised[a] = -1) or ValidLeaderIdx(promised[a])) and
+       ((acceptedBal[a] = -1) or ValidLeaderIdx(acceptedBal[a])));
+
+  -- Message invariants
+
+  check "Acceptor Valid Pending Prepare"
+    forall (a: AcceptorId)
+      (pendingPrepare[a] >= 0) => (Prepare(pendingPrepare[a]) in sentMsgs);
+
+  check "Acceptor Accepted Implies Proposed"
+    forall (a: AcceptorId)
+      (acceptedBal[a] >= 0) =>
+        (Propose(acceptedBal[a], acceptedVal[a]) in sentMsgs);
+
+  check "Leader Received Promise Implies Promise Msg"
+    forall (b: LeaderId) forall (a: AcceptorId)
+      ('(b, a) in promises) =>
+        (exists (vb: LeaderId) exists (v: Value) exists (hv: bool)
+          Promise(b, a, hv, v, vb) in sentMsgs);
+
+  check "Leader Valid Highest Heard"
+    forall (b: LeaderId)
+      (ValidLeaderIdx(b) and (highestHeard[b] >= 0)) =>
+        ((highestHeard[b] < b) and
+         (Propose(highestHeard[b], ldrValue[b]) in sentMsgs));
+
+  check "Learner Received Accept Implies Accept Msg"
+    forall (b: LeaderId) forall (l: LearnerId) forall (v: Value)
+    forall (a: AcceptorId)
+      ('(l, v, b, a) in accepts) => (Accept(v, b, a) in sentMsgs);
+
+  check "Learned Implies Quorum Of Accepts"
+    forall (l: LearnerId)
+      hasLearned[l] => (exists (b: LeaderId) '(l, learned[l], b) in hasP2Quorum);
+
+  -- Application invariants
+
+  check "Acceptor Promised Larger Than Accepted"
+    forall (a: AcceptorId)
+      (acceptedBal[a] >= 0) => (acceptedBal[a] <= promised[a]);
+
+  -- The invariants on messages quantify over the fields of a message
+  -- rather than over the message: a quantifier over the datatype binds
+  -- its tag and every payload field, which makes the instantiation of an
+  -- invariant on a pair of messages far more expensive for the solver.
+  check "Promise Msg Implies Acceptor Promised At Least"
+    forall (b: LeaderId) forall (vb: LeaderId)
+    forall (a: AcceptorId) forall (v: Value) forall (hv: bool)
+      (Promise(b, a, hv, v, vb) in sentMsgs) => (b <= promised[a]);
+
+  check "Accept Msg Implies Acceptor Accepted At Least"
+    forall (b: LeaderId) forall (a: AcceptorId) forall (v: Value)
+      (Accept(v, b, a) in sentMsgs) => (b <= acceptedBal[a]);
+
+  check "Accept Msg Implies Proposed"
+    forall (b: LeaderId) forall (a: AcceptorId) forall (v: Value)
+      (Accept(v, b, a) in sentMsgs) => (Propose(b, v) in sentMsgs);
+
+  check "Promise VB Implies Proposed At Smaller Ballot"
+    forall (b: LeaderId) forall (vb: LeaderId)
+    forall (a: AcceptorId) forall (v: Value)
+      (Promise(b, a, true, v, vb) in sentMsgs) =>
+        ((Propose(vb, v) in sentMsgs) and (vb < b));
+
+  check "Accept Msg Implies Larger Promise Carries VB"
+    forall (c: LeaderId) forall (b: LeaderId) forall (vb: LeaderId)
+    forall (a: AcceptorId) forall (v: Value) forall (pv: Value) forall (hv: bool)
+      ((Accept(v, c, a) in sentMsgs) and (Promise(b, a, hv, pv, vb) in sentMsgs) and
+       (c < b)) =>
+        (hv and (c <= vb));
+
+  check "One Promise Msg Per Ballot And Acceptor"
+    forall (b: LeaderId) forall (vb1: LeaderId) forall (vb2: LeaderId)
+    forall (a: AcceptorId) forall (v1: Value) forall (v2: Value)
+    forall (hv1: bool) forall (hv2: bool)
+      ((Promise(b, a, hv1, v1, vb1) in sentMsgs) and
+       (Promise(b, a, hv2, v2, vb2) in sentMsgs)) =>
+        ((hv1 = hv2) and (v1 = v2) and (vb1 = vb2));
+
+  check "Propose Msg Implies Leader State"
+    forall (b: LeaderId) forall (v: Value)
+      (Propose(b, v) in sentMsgs) =>
+        ((b in hasP1Quorum) and (ldrValue[b] = v));
+
+  check "One Value Per Propose Ballot"
+    forall (b: LeaderId) forall (v1: Value) forall (v2: Value)
+      ((Propose(b, v1) in sentMsgs) and (Propose(b, v2) in sentMsgs)) => v1 = v2;
+
+  check "Leader Highest Heard Covers Received Promises"
+    forall (b: LeaderId) forall (vb: LeaderId)
+    forall (a: AcceptorId) forall (v: Value)
+      ((Promise(b, a, true, v, vb) in sentMsgs) and ('(b, a) in promises)) =>
+        (vb <= highestHeard[b]);
+
+  check "Leader Received Promise Implies Acceptor Promised At Least"
+    forall (b: LeaderId) forall (a: AcceptorId)
+      ('(b, a) in promises) => (b <= promised[a]);
+
+  -- The core Paxos invariant. Dafny's proof follows the chain of highest
+  -- heard ballots downwards with a recursive lemma, which k-induction
+  -- cannot replay. Instead, a proposal (b, v) is safe at every smaller
+  -- ballot c because some leader q in (c, b] on that chain proposed v
+  -- itself while having heard at most c: q's own promise quorum then saw
+  -- no vote at all above what q heard, and only votes for v at that
+  -- ballot. Stated this way the chain is quantified over, so the
+  -- invariant is inductive in one step: the proposing leader is the
+  -- witness at and above the ballot it heard, and below that the witness
+  -- of the proposal it adopted its value from.
+
+  check "Own Quorum Has No Votes Above Heard"
+    forall (c: LeaderId) forall (b: LeaderId) forall (v: Value)
+    forall (w: Value) forall (a: AcceptorId)
+      ((Propose(b, v) in sentMsgs) and (highestHeard[b] < c) and (c < b) and
+       ('(b, a) in promises)) =>
+        not (Accept(w, c, a) in sentMsgs);
+
+  check "Own Quorum Votes At Heard Are For My Value"
+    forall (b: LeaderId) forall (v: Value) forall (w: Value) forall (a: AcceptorId)
+      ((Propose(b, v) in sentMsgs) and (highestHeard[b] >= 0) and
+       ('(b, a) in promises) and (Accept(w, highestHeard[b], a) in sentMsgs)) =>
+        w = v;
+
+  -- The conjunct on highestHeard[c] is implied by Valid Ballot Fields; it
+  -- is there to give the solvers a term to instantiate c with, which the
+  -- arithmetic bounds alone do not provide.
+  check "Safe At"
+    forall (c: LeaderId) forall (b: LeaderId) forall (v: Value)
+      ((Propose(b, v) in sentMsgs) and (0 <= c) and (c < b) and
+       (highestHeard[c] >= -1)) =>
+        (exists (q: LeaderId)
+          (c < q) and (q <= b) and (Propose(q, v) in sentMsgs) and
+          (highestHeard[q] <= c));
+
+  check "Chosen Val Implies Propose Only Val"
+    forall (b: LeaderId) forall (b2: LeaderId)
+    forall (l: LearnerId) forall (v: Value) forall (v2: Value)
+      (('(l, v, b) in hasP2Quorum) and (Propose(b2, v2) in sentMsgs) and
+       (b < b2) and (highestHeard[b] >= -1)) =>
+        v2 = v;
+
+  check "At Most One Chosen Val"
+    forall (b1: LeaderId) forall (b2: LeaderId)
+    forall (l1: LearnerId) forall (l2: LearnerId)
+    forall (v1: Value) forall (v2: Value)
+      (('(l1, v1, b1) in hasP2Quorum) and ('(l2, v2, b2) in hasP2Quorum)) =>
+        v1 = v2;
+
+  --%MAIN;
+tel
+
+-- Witnesses for these properties are only found when the system is
+-- instantiated concretely: uncomment the alternative declarations of
+-- AcceptorId, LearnerId, Value, PreferredValue and InitHighestHeard near
+-- the top of the file (and comment out the abstract ones), and set NL to 2.
+-- Two leaders, three acceptors, two learners and two values suffice for
+-- every property below. With the symbolic declarations, bounded model checking does not
+-- get past the initial state: the solver has to build a model of the
+-- quantified constraints on the constant maps and the quorum oracles
+-- together with a few transitions, and it does not terminate on those
+-- queries. The invariant proof in Invariant_Properties does not have that
+-- problem, since it only needs unsatisfiability, and it is carried out
+-- over the abstract types and for any number of leaders.
+node Reachability_Properties() returns (
+  promises: PromiseRel;
+  ldrValue: map<LeaderId, Value>;
+  highestHeard: map<LeaderId, LeaderId>;
+  pendingPrepare: map<AcceptorId, LeaderId>;
+  promised: map<AcceptorId, LeaderId>;
+  acceptedBal: map<AcceptorId, LeaderId>;
+  acceptedVal: map<AcceptorId, Value>;
+  accepts: AcceptRel;
+  learned: map<LearnerId, Value>;
+  hasLearned: map<LearnerId, bool>;
+  hasP1Quorum: P1Set;
+  hasP2Quorum: P2Set;
+  sentMsgs: MsgSet
+);
+let
+  promises, ldrValue, highestHeard, pendingPrepare, promised, acceptedBal,
+  acceptedVal, accepts, learned, hasLearned, hasP1Quorum, hasP2Quorum,
+  sentMsgs = DistributedSystem();
+
+  check reachable "A prepare is sent"
+    exists (m: Message) (m in sentMsgs) and Prepare?(m);
+
+  check reachable "An acceptor promises"
+    exists (a: AcceptorId) promised[a] >= 0;
+
+  check reachable "A leader receives a promise"
+    exists (b: LeaderId) exists (a: AcceptorId) '(b, a) in promises;
+
+  check reachable "A leader has a quorum of promises"
+    exists (b: LeaderId) b in hasP1Quorum;
+
+  check reachable "A propose is sent"
+    exists (m: Message) (m in sentMsgs) and Propose?(m);
+
+  check reachable "An acceptor accepts"
+    exists (a: AcceptorId) acceptedBal[a] >= 0;
+
+  check reachable "An accept is sent"
+    exists (m: Message) (m in sentMsgs) and Accept?(m);
+
+  check reachable "A learner has a quorum of accepts"
+    exists (b: LeaderId) exists (l: LearnerId) exists (v: Value)
+      '(l, v, b) in hasP2Quorum;
+
+  check reachable "A learner learns a value"
+    exists (l: LearnerId) hasLearned[l];
+
+  check reachable "Two learners learn a value"
+    exists (l1: LearnerId) exists (l2: LearnerId)
+      (l1 <> l2) and hasLearned[l1] and hasLearned[l2];
+
+  check reachable "An acceptor promises twice"
+    exists (m1: Message) exists (m2: Message)
+      (m1 in sentMsgs) and (m2 in sentMsgs) and
+      Promise?(m1) and Promise?(m2) and then
+      ((m1 <> m2) and (m1.promAcc = m2.promAcc));
+
+  check reachable "A leader hears an accepted value"
+    exists (b: LeaderId) ValidLeaderIdx(b) and (highestHeard[b] >= 0);
+
+  check reachable "A leader adopts a value that is not its preferred one"
+    exists (b: LeaderId) ValidLeaderIdx(b) and (ldrValue[b] <> PreferredValue[b]);
+
+  check reachable "An acceptor rejects a propose"
+    exists (m: Message) exists (a: AcceptorId)
+      (m in sentMsgs) and Propose?(m) and then
+      ((promised[a] > m.propBal) and (acceptedBal[a] <> m.propBal));
+tel
