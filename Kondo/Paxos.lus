@@ -597,18 +597,18 @@ let
   --%MAIN;
 tel
 
--- Witnesses for these properties are only found when the system is
--- instantiated concretely: uncomment the alternative declarations of
--- AcceptorId, LearnerId, Value, PreferredValue and InitHighestHeard near
--- the top of the file (and comment out the abstract ones), and set NL to 2.
--- Two leaders, three acceptors, two learners and two values suffice for
--- every property below. With the symbolic declarations, bounded model checking does not
--- get past the initial state: the solver has to build a model of the
--- quantified constraints on the constant maps and the quorum oracles
--- together with a few transitions, and it does not terminate on those
--- queries. The invariant proof in Invariant_Properties does not have that
--- problem, since it only needs unsatisfiability, and it is carried out
--- over the abstract types and for any number of leaders.
+-- Bounded model checking finds witnesses for these properties only with
+-- difficulty. Even with the system instantiated concretely (uncomment the
+-- alternative declarations of AcceptorId, LearnerId, Value, PreferredValue
+-- and InitHighestHeard near the top of the file, comment out the abstract
+-- ones, and set NL to 2), only the first property below is witnessed
+-- within half an hour: every model the solver builds has to satisfy the
+-- quantified constraints of the quorum oracles, and model building under
+-- quantifiers is where the solvers are weakest. The invariant proof in
+-- Invariant_Properties does not have that problem, since it only needs
+-- unsatisfiability. Witnesses for the other properties would need the
+-- oracles replaced by a concrete majority condition over the enumerated
+-- acceptors, which is quantifier-free.
 node Reachability_Properties() returns (
   promises: PromiseRel;
   ldrValue: map<LeaderId, Value>;
