@@ -1,14 +1,23 @@
 -- Verification. All properties of Invariant_Properties are valid by
 -- 1-induction, for any number of leaders, acceptors, learners and values,
--- in about three and a half minutes with
+-- in about two and a half minutes with
 --
---   kind2 --smt_solver cvc5 --cvc5_mbqi false --ind_split_props true Flex_Paxos.lus
+--   kind2 --smt_solver cvc5 --ind_split_props true Flex_Paxos.lus
 --
--- The two flags are additions to Kind 2 made for these models: cvc5 without
--- model-based quantifier instantiation refutes the step queries at once
--- where it otherwise gives up on them, and the inductive step checking the
--- properties one at a time, in the order written and using the earlier ones
--- as lemmas, is what keeps every query small.
+-- --ind_split_props is an addition to Kind 2 made for these models: it has
+-- the inductive step check the properties one at a time, in the order
+-- written and using the earlier ones as lemmas, rather than the conjunction
+-- of all of them in one query. It is what keeps every query small, and it is
+-- not optional here; with the properties checked together not one of them is
+-- proved, in half an hour or at all.
+--
+-- cvc5 is not optional either. Z3 discharges 28 of the 53 step queries and
+-- then stops making progress, with or without its own model-based
+-- quantifier instantiation turned off (smt.mbqi=false). What separates the
+-- two is what is left when that technique gives up: cvc5 still has
+-- --full-saturate-quant to refute with, where Z3 falls back on E-matching
+-- alone. The Kondo election models are the opposite case, fast under Z3, so
+-- the solver is chosen per model rather than once.
 --
 -- The ballots being abstract, rather than integers, is what makes the proof
 -- go through rather than a matter of taste. With integer ballots the step of
