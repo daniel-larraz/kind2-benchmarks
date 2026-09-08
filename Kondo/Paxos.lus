@@ -1,24 +1,34 @@
 -- Verification. All properties of Invariant_Properties are valid by
--- 1-induction for any number of acceptors, learners and values, and for the
--- fixed number of leaders NL below (checked with NL = 3, 4 and 5), with
+-- 1-induction, for any number of leaders, acceptors, learners and values,
+-- in about three and a half minutes with
 --
 --   kind2 --smt_solver cvc5 --cvc5_mbqi false --ind_split_props true Paxos.lus
 --
 -- The two flags are additions to Kind 2 made for these models: cvc5 without
 -- model-based quantifier instantiation refutes the step queries at once
 -- where it otherwise gives up on them, and the inductive step checking the
--- properties one at a time, in the order written and using the earlier
--- ones as lemmas, is what keeps every query small. With NL left symbolic
--- (the commented declaration) every property up to and including the
--- own-quorum lemmas is still proved the same way, but the step of Safe At
--- does not return: a symbolic bound on an integer-indexed chain together
--- with the abstract sorts is beyond the instantiation heuristics of both
--- Z3 and cvc5, although each ingredient alone costs a few seconds.
+-- properties one at a time, in the order written and using the earlier ones
+-- as lemmas, is what keeps every query small.
+--
+-- The ballots being abstract, rather than integers, is what makes the proof
+-- go through rather than a matter of taste. With integer ballots the step of
+-- Safe At does not return, whether their number is fixed by a constant left
+-- symbolic or left unbounded altogether; every other property is proved
+-- either way. The chain Safe At quantifies over is what the solver has to
+-- instantiate, and over the integers it searches among arithmetic terms,
+-- while over an abstract type it has only the three order axioms below to
+-- work with. Fixing the number of leaders to a small constant also works,
+-- for the same reason: it makes the chain finite.
 --
 -- Leaders are identified by their ballot: leader b proposes at ballot b.
--- Ballots are compared, so LeaderId is an integer, 0 .. NL-1. The absent
--- ballot (Dafny's MNNone / None) is encoded as -1.
-type LeaderId = int;
+-- The ballots are an abstract type, so the model is parametric in how many
+-- there are. What the protocol needs of them is an order, which an abstract
+-- type does not carry, so it is supplied as a relation: Ballots is a strict
+-- total order with a least element Bot, which stands for the absent ballot
+-- (Dafny's MNNone / None). The relation is a set of pairs rather than an
+-- imported function because Kind 2 does not allow a quantified variable as
+-- the argument of a call to a function it cannot inline.
+type LeaderId;
 
 type AcceptorId;
 -- type AcceptorId = enum {A1, A2, A3};
@@ -29,13 +39,35 @@ type LearnerId;
 type Value;
 -- type Value = enum {V1, V2};
 
--- Number of leaders (ballots); see the note on verification above
-const NL : int = 3;
--- const NL : subtype { n : int | n > 0 };
+type BalRel = set<[LeaderId, LeaderId]>;
 
+const Bot : LeaderId;
+
+const Ballots : subtype { s : BalRel |
+  (forall (a: LeaderId) not ('(a, a) in s))
+  and
+  (forall (a: LeaderId) forall (c: LeaderId) forall (d: LeaderId)
+    (('(a, c) in s) and ('(c, d) in s)) => ('(a, d) in s))
+  and
+  (forall (a: LeaderId) forall (c: LeaderId)
+    (a <> c) => (('(a, c) in s) or ('(c, a) in s)))
+  and
+  (forall (a: LeaderId) (a <> Bot) => ('(Bot, a) in s)) };
+
+transparent function BLt(a: LeaderId; c: LeaderId) returns (r: bool);
+let
+  r = '(a, c) in Ballots;
+tel
+
+transparent function BLe(a: LeaderId; c: LeaderId) returns (r: bool);
+let
+  r = (a = c) or ('(a, c) in Ballots);
+tel
+
+-- Every ballot but the absent one identifies a leader
 transparent function ValidLeaderIdx(b: LeaderId) returns (r: bool);
 let
-  r = (0 <= b) and (b < NL);
+  r = b <> Bot;
 tel
 
 -- The value carried by a promise that reports no accepted value-ballot
@@ -76,18 +108,16 @@ type LearnerStep = enum {Learn, LearnerStutter};
 
 -- Each leader's preferred value
 const PreferredValue : map<LeaderId, Value>;
--- const PreferredValue : map<LeaderId, Value> = map[0 := V1; 1 := V2];
 
 -- Initial leader state: no promises received, nothing heard
 const InitPromises : PromiseRel = {}@<[LeaderId, AcceptorId]>;
 
 const InitHighestHeard : subtype { m : map<LeaderId, LeaderId> |
-  forall (b: LeaderId) m[b] = -1 };
--- const InitHighestHeard : map<LeaderId, LeaderId> = map[0 := -1; 1 := -1];
+  forall (b: LeaderId) m[b] = Bot };
 
 -- Initial acceptor state: no pending prepare, nothing promised or accepted
 const InitBallots : subtype { m : map<AcceptorId, LeaderId> |
-  forall (a: AcceptorId) m[a] = -1 };
+  forall (a: AcceptorId) m[a] = Bot };
 
 const InitAcceptedVal : subtype { m : map<AcceptorId, Value> |
   forall (a: AcceptorId) m[a] = NoValue };
@@ -140,12 +170,12 @@ let
   -- adopt the promise's accepted value if its ballot beats what I heard
   do_update = Promise?(nw_recv) and then
               (recv_promise and nw_recv.promHasVB and
-               (last_hh[id] < nw_recv.promVBal));
+               BLt(last_hh[id], nw_recv.promVBal));
 
   send_prepare = NoMsg?(nw_recv) and (step = SendPrepare);
 
   send_propose = NoMsg?(nw_recv) and (step = SendPropose) and
-                 hasP1Quorum and (last_hh[id] < id);
+                 hasP1Quorum and BLt(last_hh[id], id);
 
   nw_send = if send_prepare then Prepare(id)
             else if send_propose then Propose(id, last_value[id])
@@ -188,32 +218,32 @@ let
   aval = last_accVal[id];
 
   -- receive a prepare: park it until the next MaybePromise step
-  recv_prepare = Prepare?(nw_recv) and (pend = -1);
+  recv_prepare = Prepare?(nw_recv) and (pend = Bot);
 
   -- answer the pending prepare: promise if its ballot beats my promise
-  maybe_promise = NoMsg?(nw_recv) and (step = MaybePromise) and (pend >= 0);
+  maybe_promise = NoMsg?(nw_recv) and (step = MaybePromise) and (pend <> Bot);
 
-  do_promise = maybe_promise and (prom < pend);
+  do_promise = maybe_promise and BLt(prom, pend);
 
   -- receive a propose: accept it if its ballot is at least my promise
-  recv_propose = Propose?(nw_recv) and (pend = -1);
+  recv_propose = Propose?(nw_recv) and (pend = Bot);
 
   do_accept = Propose?(nw_recv) and then
-              (recv_propose and (prom <= nw_recv.propBal));
+              (recv_propose and BLe(prom, nw_recv.propBal));
 
   -- tell the learners what I accepted, if I still stand by it
   broadcast = NoMsg?(nw_recv) and (step = BroadcastAccepted) and
-              (pend = -1) and (abal >= 0) and (prom = abal);
+              (pend = Bot) and (abal <> Bot) and (prom = abal);
 
   nw_send = if do_promise then
-              Promise(pend, id, abal >= 0,
-                      (if abal >= 0 then aval else NoValue), abal)
+              Promise(pend, id, abal <> Bot,
+                      (if abal <> Bot then aval else NoValue), abal)
             else if broadcast then Accept(aval, abal, id)
             else NoMsg;
 
   pending = when Prepare?(nw_recv) and then recv_prepare
             then last_pending[id := nw_recv.prepBal]
-            else (if maybe_promise then last_pending[id := -1]
+            else (if maybe_promise then last_pending[id := Bot]
                   else last_pending);
 
   promised = when Propose?(nw_recv) and then do_accept
@@ -311,7 +341,7 @@ let
                     (tk = NoHost -> tk <> NoHost) and
                     (LeaderHost?(tk) ==> ValidLeaderIdx(tk.ldr)) };
 
-  ldr_id = when LeaderHost?(tk_holder) then tk_holder.ldr else 0;
+  ldr_id = when LeaderHost?(tk_holder) then tk_holder.ldr else Bot;
   acc_id = when AcceptorHost?(tk_holder) then tk_holder.acc else any@<AcceptorId>;
   lnr_id = when LearnerHost?(tk_holder) then tk_holder.lnr else any@<LearnerId>;
 
@@ -436,29 +466,29 @@ let
        (Promise?(m) ==>
           (ValidLeaderIdx(m.promBal) and
            (m.promHasVB => ValidLeaderIdx(m.promVBal)) and
-           ((not m.promHasVB) => ((m.promVBal = -1) and (m.promVal = NoValue))))) and
+           ((not m.promHasVB) => ((m.promVBal = Bot) and (m.promVal = NoValue))))) and
        (Propose?(m) ==> ValidLeaderIdx(m.propBal)) and
        (Accept?(m) ==> ValidLeaderIdx(m.accBal)) and
        (not NoMsg?(m)));
 
   check "Valid Ballot Fields"
     (forall (b: LeaderId) ValidLeaderIdx(b) =>
-       ((highestHeard[b] = -1) or ValidLeaderIdx(highestHeard[b])))
+       ((highestHeard[b] = Bot) or ValidLeaderIdx(highestHeard[b])))
     and
     (forall (a: AcceptorId)
-       ((pendingPrepare[a] = -1) or ValidLeaderIdx(pendingPrepare[a])) and
-       ((promised[a] = -1) or ValidLeaderIdx(promised[a])) and
-       ((acceptedBal[a] = -1) or ValidLeaderIdx(acceptedBal[a])));
+       ((pendingPrepare[a] = Bot) or ValidLeaderIdx(pendingPrepare[a])) and
+       ((promised[a] = Bot) or ValidLeaderIdx(promised[a])) and
+       ((acceptedBal[a] = Bot) or ValidLeaderIdx(acceptedBal[a])));
 
   -- Message invariants
 
   check "Acceptor Valid Pending Prepare"
     forall (a: AcceptorId)
-      (pendingPrepare[a] >= 0) => (Prepare(pendingPrepare[a]) in sentMsgs);
+      (pendingPrepare[a] <> Bot) => (Prepare(pendingPrepare[a]) in sentMsgs);
 
   check "Acceptor Accepted Implies Proposed"
     forall (a: AcceptorId)
-      (acceptedBal[a] >= 0) =>
+      (acceptedBal[a] <> Bot) =>
         (Propose(acceptedBal[a], acceptedVal[a]) in sentMsgs);
 
   check "Leader Received Promise Implies Promise Msg"
@@ -469,8 +499,8 @@ let
 
   check "Leader Valid Highest Heard"
     forall (b: LeaderId)
-      (ValidLeaderIdx(b) and (highestHeard[b] >= 0)) =>
-        ((highestHeard[b] < b) and
+      (ValidLeaderIdx(b) and (highestHeard[b] <> Bot)) =>
+        (BLt(highestHeard[b], b) and
          (Propose(highestHeard[b], ldrValue[b]) in sentMsgs));
 
   check "Learner Received Accept Implies Accept Msg"
@@ -486,7 +516,7 @@ let
 
   check "Acceptor Promised Larger Than Accepted"
     forall (a: AcceptorId)
-      (acceptedBal[a] >= 0) => (acceptedBal[a] <= promised[a]);
+      (acceptedBal[a] <> Bot) => BLe(acceptedBal[a], promised[a]);
 
   -- The invariants on messages quantify over the fields of a message
   -- rather than over the message: a quantifier over the datatype binds
@@ -495,11 +525,11 @@ let
   check "Promise Msg Implies Acceptor Promised At Least"
     forall (b: LeaderId) forall (vb: LeaderId)
     forall (a: AcceptorId) forall (v: Value) forall (hv: bool)
-      (Promise(b, a, hv, v, vb) in sentMsgs) => (b <= promised[a]);
+      (Promise(b, a, hv, v, vb) in sentMsgs) => BLe(b, promised[a]);
 
   check "Accept Msg Implies Acceptor Accepted At Least"
     forall (b: LeaderId) forall (a: AcceptorId) forall (v: Value)
-      (Accept(v, b, a) in sentMsgs) => (b <= acceptedBal[a]);
+      (Accept(v, b, a) in sentMsgs) => BLe(b, acceptedBal[a]);
 
   check "Accept Msg Implies Proposed"
     forall (b: LeaderId) forall (a: AcceptorId) forall (v: Value)
@@ -509,14 +539,14 @@ let
     forall (b: LeaderId) forall (vb: LeaderId)
     forall (a: AcceptorId) forall (v: Value)
       (Promise(b, a, true, v, vb) in sentMsgs) =>
-        ((Propose(vb, v) in sentMsgs) and (vb < b));
+        ((Propose(vb, v) in sentMsgs) and BLt(vb, b));
 
   check "Accept Msg Implies Larger Promise Carries VB"
     forall (c: LeaderId) forall (b: LeaderId) forall (vb: LeaderId)
     forall (a: AcceptorId) forall (v: Value) forall (pv: Value) forall (hv: bool)
       ((Accept(v, c, a) in sentMsgs) and (Promise(b, a, hv, pv, vb) in sentMsgs) and
-       (c < b)) =>
-        (hv and (c <= vb));
+       BLt(c, b)) =>
+        (hv and BLe(c, vb));
 
   check "One Promise Msg Per Ballot And Acceptor"
     forall (b: LeaderId) forall (vb1: LeaderId) forall (vb2: LeaderId)
@@ -539,11 +569,11 @@ let
     forall (b: LeaderId) forall (vb: LeaderId)
     forall (a: AcceptorId) forall (v: Value)
       ((Promise(b, a, true, v, vb) in sentMsgs) and ('(b, a) in promises)) =>
-        (vb <= highestHeard[b]);
+        BLe(vb, highestHeard[b]);
 
   check "Leader Received Promise Implies Acceptor Promised At Least"
     forall (b: LeaderId) forall (a: AcceptorId)
-      ('(b, a) in promises) => (b <= promised[a]);
+      ('(b, a) in promises) => BLe(b, promised[a]);
 
   -- The core Paxos invariant. Dafny's proof follows the chain of highest
   -- heard ballots downwards with a recursive lemma, which k-induction
@@ -559,13 +589,13 @@ let
   check "Own Quorum Has No Votes Above Heard"
     forall (c: LeaderId) forall (b: LeaderId) forall (v: Value)
     forall (w: Value) forall (a: AcceptorId)
-      ((Propose(b, v) in sentMsgs) and (highestHeard[b] < c) and (c < b) and
+      ((Propose(b, v) in sentMsgs) and BLt(highestHeard[b], c) and BLt(c, b) and
        ('(b, a) in promises)) =>
         not (Accept(w, c, a) in sentMsgs);
 
   check "Own Quorum Votes At Heard Are For My Value"
     forall (b: LeaderId) forall (v: Value) forall (w: Value) forall (a: AcceptorId)
-      ((Propose(b, v) in sentMsgs) and (highestHeard[b] >= 0) and
+      ((Propose(b, v) in sentMsgs) and (highestHeard[b] <> Bot) and
        ('(b, a) in promises) and (Accept(w, highestHeard[b], a) in sentMsgs)) =>
         w = v;
 
@@ -574,17 +604,16 @@ let
   -- arithmetic bounds alone do not provide.
   check "Safe At"
     forall (c: LeaderId) forall (b: LeaderId) forall (v: Value)
-      ((Propose(b, v) in sentMsgs) and (0 <= c) and (c < b) and
-       (highestHeard[c] >= -1)) =>
+      ((Propose(b, v) in sentMsgs) and (c <> Bot) and BLt(c, b)) =>
         (exists (q: LeaderId)
-          (c < q) and (q <= b) and (Propose(q, v) in sentMsgs) and
-          (highestHeard[q] <= c));
+          BLt(c, q) and BLe(q, b) and (Propose(q, v) in sentMsgs) and
+          BLe(highestHeard[q], c));
 
   check "Chosen Val Implies Propose Only Val"
     forall (b: LeaderId) forall (b2: LeaderId)
     forall (l: LearnerId) forall (v: Value) forall (v2: Value)
       (('(l, v, b) in hasP2Quorum) and (Propose(b2, v2) in sentMsgs) and
-       (b < b2) and (highestHeard[b] >= -1)) =>
+       BLt(b, b2)) =>
         v2 = v;
 
   check "At Most One Chosen Val"
@@ -598,17 +627,17 @@ let
 tel
 
 -- Bounded model checking finds witnesses for these properties only with
--- difficulty. Even with the system instantiated concretely (uncomment the
--- alternative declarations of AcceptorId, LearnerId, Value, PreferredValue
--- and InitHighestHeard near the top of the file, comment out the abstract
--- ones, and set NL to 2), only the first property below is witnessed
--- within half an hour: every model the solver builds has to satisfy the
--- quantified constraints of the quorum oracles, and model building under
--- quantifiers is where the solvers are weakest. The invariant proof in
+-- difficulty. Every model the solver builds has to satisfy the quantified
+-- constraints of the quorum oracles and of the ballot order, and model
+-- building under quantifiers is where the solvers are weakest: with the
+-- types instantiated by finite enumerations, and the earlier version of
+-- this model that numbered the ballots, only the first property below was
+-- witnessed within half an hour. The invariant proof in
 -- Invariant_Properties does not have that problem, since it only needs
 -- unsatisfiability. Witnesses for the other properties would need the
 -- oracles replaced by a concrete majority condition over the enumerated
--- acceptors, which is quantifier-free.
+-- acceptors, and the order by a concrete relation over enumerated ballots,
+-- both of which are quantifier-free.
 node Reachability_Properties() returns (
   promises: PromiseRel;
   ldrValue: map<LeaderId, Value>;
@@ -633,7 +662,7 @@ let
     exists (m: Message) (m in sentMsgs) and Prepare?(m);
 
   check reachable "An acceptor promises"
-    exists (a: AcceptorId) promised[a] >= 0;
+    exists (a: AcceptorId) promised[a] <> Bot;
 
   check reachable "A leader receives a promise"
     exists (b: LeaderId) exists (a: AcceptorId) '(b, a) in promises;
@@ -645,7 +674,7 @@ let
     exists (m: Message) (m in sentMsgs) and Propose?(m);
 
   check reachable "An acceptor accepts"
-    exists (a: AcceptorId) acceptedBal[a] >= 0;
+    exists (a: AcceptorId) acceptedBal[a] <> Bot;
 
   check reachable "An accept is sent"
     exists (m: Message) (m in sentMsgs) and Accept?(m);
@@ -668,7 +697,7 @@ let
       ((m1 <> m2) and (m1.promAcc = m2.promAcc));
 
   check reachable "A leader hears an accepted value"
-    exists (b: LeaderId) ValidLeaderIdx(b) and (highestHeard[b] >= 0);
+    exists (b: LeaderId) ValidLeaderIdx(b) and (highestHeard[b] <> Bot);
 
   check reachable "A leader adopts a value that is not its preferred one"
     exists (b: LeaderId) ValidLeaderIdx(b) and (ldrValue[b] <> PreferredValue[b]);
@@ -676,5 +705,5 @@ let
   check reachable "An acceptor rejects a propose"
     exists (m: Message) exists (a: AcceptorId)
       (m in sentMsgs) and Propose?(m) and then
-      ((promised[a] > m.propBal) and (acceptedBal[a] <> m.propBal));
+      (BLt(m.propBal, promised[a]) and (acceptedBal[a] <> m.propBal));
 tel
